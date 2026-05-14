@@ -15,6 +15,8 @@ if TYPE_CHECKING:
     from fastapi import Request
     from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from headroom.proxy.outcome import RequestOutcome
+
 logger = logging.getLogger("headroom.proxy")
 
 DEFAULT_CLOUDCODE_API_URL = "https://cloudcode-pa.googleapis.com"
@@ -466,35 +468,39 @@ class GeminiHandlerMixin:
 
                 uncached_input_tokens = max(0, total_input_tokens - cache_read_tokens)
 
-                if self.cost_tracker:
-                    self.cost_tracker.record_tokens(
-                        model,
-                        tokens_saved,
-                        optimized_tokens,
-                        cache_read_tokens=cache_read_tokens,
-                        uncached_tokens=uncached_input_tokens,
-                    )
-
                 # Eligible-tracking is TODO for Gemini; pass the full
                 # pre-compression request size as the fallback denominator.
                 # This makes Gemini's contribution to the aggregate
                 # active_savings_percent equal its whole-request ratio —
                 # not ideal but coherent until per-part live-zone
                 # tracking exists for this provider.
-                attempted_input_tokens = total_input_tokens + tokens_saved
-                await self.metrics.record_request(
+                #
+                # Gemini reports read-side context-cache only via
+                # ``cachedContentTokenCount``. There is no write counter
+                # in the Gemini response; cache writes happen out-of-band
+                # via the explicit Cache API. cache_write_* fields on the
+                # outcome stay at their 0 defaults — the dataclass
+                # handles "this provider doesn't have this concept"
+                # without per-handler conditionals.
+                outcome = RequestOutcome(
+                    request_id=request_id,
                     provider="gemini",
                     model=model,
-                    input_tokens=total_input_tokens,
+                    original_tokens=original_tokens,
+                    optimized_tokens=total_input_tokens,
                     output_tokens=output_tokens,
                     tokens_saved=tokens_saved,
-                    latency_ms=total_latency,
-                    overhead_ms=optimization_latency,
-                    waste_signals=waste_signals_dict,
+                    attempted_input_tokens=total_input_tokens + tokens_saved,
                     cache_read_tokens=cache_read_tokens,
                     uncached_input_tokens=uncached_input_tokens,
-                    attempted_input_tokens=attempted_input_tokens,
+                    total_latency_ms=total_latency,
+                    overhead_ms=optimization_latency,
+                    waste_signals=waste_signals_dict,
+                    transforms_applied=tuple(transforms_applied),
+                    num_messages=len(body.get("contents", [])),
+                    tags=tags or {},
                 )
+                await self._record_request_outcome(outcome)
 
                 if tokens_saved > 0:
                     logger.info(
@@ -902,15 +908,22 @@ class GeminiHandlerMixin:
 
             # Fallback denominator (see comment on the main gemini
             # record_request site) — pre-comp request size.
-            attempted_input_tokens = compressed_tokens + tokens_saved
-            await self.metrics.record_request(
-                provider="gemini",
-                model=model,
-                input_tokens=compressed_tokens,
-                output_tokens=0,
-                tokens_saved=tokens_saved,
-                latency_ms=total_latency,
-                attempted_input_tokens=attempted_input_tokens,
+            # countTokens is a sizing helper; it never generates output
+            # tokens and never touches cache. The funnel handles the
+            # "nothing to report" shape with all-zero cache defaults.
+            await self._record_request_outcome(
+                RequestOutcome(
+                    request_id=request_id,
+                    provider="gemini",
+                    model=model,
+                    original_tokens=original_tokens,
+                    optimized_tokens=compressed_tokens,
+                    output_tokens=0,
+                    tokens_saved=tokens_saved,
+                    attempted_input_tokens=compressed_tokens + tokens_saved,
+                    total_latency_ms=total_latency,
+                    transforms_applied=tuple(transforms_applied),
+                )
             )
 
             if tokens_saved > 0:

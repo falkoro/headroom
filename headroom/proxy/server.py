@@ -1153,93 +1153,19 @@ class HeadroomProxy(
     async def _record_request_outcome(self, outcome: RequestOutcome) -> None:
         """Single funnel for per-request bookkeeping.
 
-        Replaces the divergent four-call sequence (``metrics.record_request``
-        + ``cost_tracker.record_tokens`` + ``logger.log(RequestLog(...))``
-        + structured PERF log) that pre-refactor lived inline at 18 sites
-        across four handler files with subtly different argument shapes.
-        Provider handlers build a :class:`RequestOutcome` from local
-        context and call here — the wire shape for metrics/log/PERF is
-        defined exactly once, in this method, and nowhere else.
+        Thin wrapper around :func:`headroom.proxy.outcome.emit_request_outcome`
+        so call sites can write ``await self._record_request_outcome(outcome)``
+        (idiomatic) instead of ``await emit_request_outcome(self, outcome)``.
+        The real implementation lives in ``outcome.py`` as a free function so
+        test dummies and provider mixins can call it without inheriting from
+        ``HeadroomProxy``.
 
         See ``docs/superpowers/specs/P0-proxy-pipeline-audit.md`` for the
         divergence catalog this funnel collapses.
         """
+        from headroom.proxy.outcome import emit_request_outcome
 
-        # 1. Prometheus / SavingsTracker.
-        await self.metrics.record_request(
-            provider=outcome.provider,
-            model=outcome.model,
-            input_tokens=outcome.optimized_tokens,
-            output_tokens=outcome.output_tokens,
-            tokens_saved=outcome.tokens_saved,
-            latency_ms=outcome.total_latency_ms,
-            cached=outcome.cache_hit,
-            overhead_ms=outcome.overhead_ms,
-            ttfb_ms=outcome.ttfb_ms,
-            pipeline_timing=outcome.pipeline_timing,
-            waste_signals=outcome.waste_signals,
-            cache_read_tokens=outcome.cache_read_tokens,
-            cache_write_tokens=outcome.cache_write_tokens,
-            cache_write_5m_tokens=outcome.cache_write_5m_tokens,
-            cache_write_1h_tokens=outcome.cache_write_1h_tokens,
-            uncached_input_tokens=outcome.uncached_input_tokens,
-            attempted_input_tokens=outcome.attempted_input_tokens,
-        )
-
-        # 2. Cost tracker (optional — disabled when proxy --no-cost).
-        if self.cost_tracker:
-            self.cost_tracker.record_tokens(
-                outcome.model,
-                outcome.tokens_saved,
-                outcome.optimized_tokens,
-                cache_read_tokens=outcome.cache_read_tokens,
-                cache_write_tokens=outcome.cache_write_tokens,
-                cache_write_5m_tokens=outcome.cache_write_5m_tokens,
-                cache_write_1h_tokens=outcome.cache_write_1h_tokens,
-                uncached_tokens=outcome.uncached_input_tokens,
-            )
-
-        # 3. Per-request log (optional — disabled when proxy
-        #    --no-request-logging or when logger isn't installed).
-        request_logger = getattr(self, "logger", None)
-        if request_logger is not None:
-            request_logger.log(
-                RequestLog(
-                    request_id=outcome.request_id,
-                    timestamp=datetime.now().isoformat(),
-                    provider=outcome.provider,
-                    model=outcome.model,
-                    input_tokens_original=outcome.original_tokens,
-                    input_tokens_optimized=outcome.optimized_tokens,
-                    output_tokens=outcome.output_tokens,
-                    tokens_saved=outcome.tokens_saved,
-                    savings_percent=outcome.savings_pct,
-                    optimization_latency_ms=outcome.overhead_ms,
-                    total_latency_ms=outcome.total_latency_ms,
-                    tags=outcome.tags,
-                    cache_hit=outcome.cache_hit,
-                    transforms_applied=list(outcome.transforms_applied),
-                    waste_signals=outcome.waste_signals,
-                    request_messages=outcome.request_messages,
-                    turn_id=outcome.turn_id,
-                )
-            )
-
-        # 4. Structured PERF log — consumed by ``headroom perf``.
-        #    Format frozen so the analyzer's key=value parser keeps
-        #    working; future P3 work replaces the free-text shape with a
-        #    structured event, at which point this becomes a presentation
-        #    of the event rather than a parallel log line.
-        logger.info(
-            f"[{outcome.request_id}] PERF "
-            f"model={outcome.model} msgs={outcome.num_messages} "
-            f"tok_before={outcome.original_tokens} tok_after={outcome.optimized_tokens} "
-            f"tok_saved={outcome.tokens_saved} "
-            f"cache_read={outcome.cache_read_tokens} cache_write={outcome.cache_write_tokens} "
-            f"cache_hit_pct={outcome.cache_hit_pct} "
-            f"opt_ms={outcome.overhead_ms:.0f} "
-            f"transforms={_summarize_transforms(list(outcome.transforms_applied))}"
-        )
+        await emit_request_outcome(self, outcome)
 
     async def _next_request_id(self) -> str:
         """Generate unique request ID."""

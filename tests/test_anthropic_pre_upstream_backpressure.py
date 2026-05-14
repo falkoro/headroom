@@ -215,6 +215,14 @@ class _DummyAnthropicHandler(AnthropicHandlerMixin):
         future = loop.run_in_executor(self._compression_executor, _wrapped)
         return await asyncio.wait_for(future, timeout=timeout)
 
+    async def _record_request_outcome(self, outcome) -> None:  # noqa: ANN001
+        # Mirror of ``HeadroomProxy._record_request_outcome`` for the
+        # mixin tests. Delegates to the free function in ``outcome.py``
+        # so the wire shape is identical to production.
+        from headroom.proxy.outcome import emit_request_outcome
+
+        await emit_request_outcome(self, outcome)
+
     async def _next_request_id(self) -> str:
         # Unique IDs so log assertions remain disambiguated under parallelism.
         return f"req-{id(object()):x}"

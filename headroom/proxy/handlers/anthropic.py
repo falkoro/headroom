@@ -25,6 +25,7 @@ import httpx
 
 from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy.auth_mode import classify_auth_mode
+from headroom.proxy.outcome import RequestOutcome
 
 logger = logging.getLogger("headroom.proxy")
 
@@ -352,7 +353,6 @@ class AnthropicHandlerMixin:
 
         from headroom.cache.compression_store import get_compression_store
         from headroom.ccr import CCRToolInjector
-        from headroom.proxy.cost import _summarize_transforms
         from headroom.proxy.helpers import (
             MAX_MESSAGE_ARRAY_LENGTH,
             MAX_REQUEST_BODY_SIZE,
@@ -361,7 +361,6 @@ class AnthropicHandlerMixin:
             compute_turn_id,
             read_request_json_with_bytes,
         )
-        from headroom.proxy.models import RequestLog
         from headroom.proxy.modes import is_cache_mode, is_token_mode
         from headroom.tokenizers import get_tokenizer
         from headroom.utils import extract_user_query
@@ -700,14 +699,28 @@ class AnthropicHandlerMixin:
                     )
                     optimization_latency = (time.time() - start_time) * 1000
 
-                    await self.metrics.record_request(
-                        provider="anthropic",
-                        model=model,
-                        input_tokens=0,
-                        output_tokens=0,
-                        tokens_saved=0,  # Savings already counted when response was cached
-                        latency_ms=optimization_latency,
-                        cached=True,
+                    # Response-cache hit: response body came from
+                    # Headroom's semantic cache, not the upstream
+                    # provider. ``from_response_cache=True`` is a
+                    # distinct signal from `cache_read_tokens > 0`
+                    # (which means upstream-prompt-cache hit). Dashboards
+                    # can split the two; the funnel collapses them into
+                    # the single `cached` boolean for Prometheus.
+                    await self._record_request_outcome(
+                        RequestOutcome(
+                            request_id=request_id,
+                            provider="anthropic",
+                            model=model,
+                            original_tokens=0,
+                            optimized_tokens=0,
+                            output_tokens=0,
+                            tokens_saved=0,
+                            attempted_input_tokens=0,
+                            from_response_cache=True,
+                            total_latency_ms=optimization_latency,
+                            overhead_ms=optimization_latency,
+                            num_messages=len(messages),
+                        )
                     )
 
                     # Remove compression headers from cached response
@@ -1610,50 +1623,36 @@ class AnthropicHandlerMixin:
                             )
                         except Exception:
                             attempted_input_tokens = original_tokens
-                        await self.metrics.record_request(
-                            provider=_backend_name,
-                            model=model,
-                            input_tokens=optimized_tokens,
-                            output_tokens=output_tokens,
-                            tokens_saved=tokens_saved,
-                            latency_ms=total_latency,
-                            cached=False,
-                            overhead_ms=optimization_latency,
-                            pipeline_timing=pipeline_timing,
-                            attempted_input_tokens=attempted_input_tokens,
-                        )
-
-                        if self.cost_tracker:
-                            self.cost_tracker.record_tokens(model, tokens_saved, optimized_tokens)
-
-                        # Log request
-                        if self.logger:
-                            self.logger.log(
-                                RequestLog(
-                                    request_id=request_id,
-                                    timestamp=datetime.now().isoformat(),
-                                    provider=_backend_name,
-                                    model=model,
-                                    input_tokens_original=original_tokens,
-                                    input_tokens_optimized=optimized_tokens,
-                                    output_tokens=output_tokens,
-                                    tokens_saved=tokens_saved,
-                                    savings_percent=(tokens_saved / original_tokens * 100)
-                                    if original_tokens > 0
-                                    else 0,
-                                    optimization_latency_ms=optimization_latency,
-                                    total_latency_ms=total_latency,
-                                    tags=tags,
-                                    cache_hit=False,
-                                    transforms_applied=transforms_applied,
-                                    request_messages=body.get("messages")
-                                    if self.config.log_full_messages
-                                    else None,
-                                    turn_id=compute_turn_id(
-                                        model, body.get("system"), body.get("messages")
-                                    ),
-                                )
+                        # Backend (Bedrock / Vertex) non-streaming.
+                        # Cache metrics aren't extracted from the backend
+                        # response here yet — that's a follow-up. The
+                        # funnel passes 0s for the cache fields, which
+                        # is the same observable behaviour as the
+                        # pre-refactor code (which also omitted them).
+                        await self._record_request_outcome(
+                            RequestOutcome(
+                                request_id=request_id,
+                                provider=_backend_name,
+                                model=model,
+                                original_tokens=original_tokens,
+                                optimized_tokens=optimized_tokens,
+                                output_tokens=output_tokens,
+                                tokens_saved=tokens_saved,
+                                attempted_input_tokens=attempted_input_tokens,
+                                total_latency_ms=total_latency,
+                                overhead_ms=optimization_latency,
+                                pipeline_timing=pipeline_timing,
+                                transforms_applied=tuple(transforms_applied),
+                                num_messages=len(body.get("messages", [])),
+                                tags=tags,
+                                turn_id=compute_turn_id(
+                                    model, body.get("system"), body.get("messages")
+                                ),
+                                request_messages=body.get("messages")
+                                if self.config.log_full_messages
+                                else None,
                             )
+                        )
 
                         return JSONResponse(
                             status_code=backend_response.status_code,
@@ -2087,18 +2086,6 @@ class AnthropicHandlerMixin:
                         original_messages=next_original_messages,
                     )
 
-                    if self.cost_tracker:
-                        self.cost_tracker.record_tokens(
-                            model,
-                            tokens_saved,
-                            optimized_tokens,
-                            cache_read_tokens=cr_tokens,
-                            cache_write_tokens=cw_tokens,
-                            cache_write_5m_tokens=cw_5m_tokens,
-                            cache_write_1h_tokens=cw_1h_tokens,
-                            uncached_tokens=uncached_input_tokens,
-                        )
-
                     # Cache response
                     if self.cache and response.status_code == 200:
                         await self.cache.set(
@@ -2109,26 +2096,10 @@ class AnthropicHandlerMixin:
                             tokens_saved=tokens_saved,
                         )
 
-                    # Record metrics — use optimized_tokens (what we sent), not API's
-                    # input_tokens which is just the non-cached portion with prompt caching
-                    await self.metrics.record_request(
-                        provider="anthropic",
-                        model=model,
-                        input_tokens=optimized_tokens,
-                        output_tokens=output_tokens,
-                        tokens_saved=tokens_saved,
-                        latency_ms=total_latency,
-                        overhead_ms=optimization_latency,
-                        pipeline_timing=pipeline_timing,
-                        waste_signals=waste_signals_dict,
-                        cache_read_tokens=cr_tokens,
-                        cache_write_tokens=cw_tokens,
-                        cache_write_5m_tokens=cw_5m_tokens,
-                        cache_write_1h_tokens=cw_1h_tokens,
-                        uncached_input_tokens=uncached_input_tokens,
-                    )
-
-                    # Subscription tracker: update headroom contribution counters
+                    # Subscription tracker: update headroom contribution
+                    # counters. Provider-specific OAuth/subscription
+                    # accounting — stays outside the funnel (different
+                    # concern, only fires for Bearer-not-sk-ant tokens).
                     if _auth_header.startswith("Bearer ") and not _auth_header.startswith(
                         "Bearer sk-ant-api"
                     ):
@@ -2144,56 +2115,53 @@ class AnthropicHandlerMixin:
                                 tokens_saved_cache_reads=cr_tokens,
                             )
 
-                    # Log request
-                    if self.logger:
-                        self.logger.log(
-                            RequestLog(
-                                request_id=request_id,
-                                timestamp=datetime.now().isoformat(),
-                                provider="anthropic",
-                                model=model,
-                                input_tokens_original=original_tokens,
-                                input_tokens_optimized=optimized_tokens,
-                                output_tokens=output_tokens,
-                                tokens_saved=tokens_saved,
-                                savings_percent=(tokens_saved / original_tokens * 100)
-                                if original_tokens > 0
-                                else 0,
-                                optimization_latency_ms=optimization_latency,
-                                total_latency_ms=total_latency,
-                                tags=tags,
-                                cache_hit=cache_hit,
-                                transforms_applied=transforms_applied,
-                                waste_signals=waste_signals_dict,
-                                request_messages=messages
-                                if self.config.log_full_messages
-                                else None,
-                                turn_id=compute_turn_id(
-                                    model, body.get("system"), body.get("messages")
-                                ),
-                            )
+                    # The pre-refactor PERF emit (above) read raw usage
+                    # off ``resp_usage`` instead of trusting cr_tokens /
+                    # cw_tokens. Both paths land on identical numbers
+                    # (extraction happens just above the cost_tracker
+                    # call), so the funnel uses the already-computed
+                    # values for consistency. Pre-refactor's
+                    # ``cache_hit`` local was correctly derived from
+                    # cache_read>0; the funnel re-derives via the
+                    # outcome property — same result.
+                    #
+                    # ``attempted_input_tokens`` was MISSING from the
+                    # pre-refactor record_request call here (one of the
+                    # 7-of-18 sites the P0 audit flagged). The funnel
+                    # forces it to a value — using
+                    # ``optimized_tokens + tokens_saved`` as the
+                    # fallback denominator, same as the streaming path
+                    # uses (see _finalize_stream_response). Dashboards
+                    # that were showing 0% active-savings on non-
+                    # streaming Anthropic traffic will now show the
+                    # correct ratio.
+                    await self._record_request_outcome(
+                        RequestOutcome(
+                            request_id=request_id,
+                            provider="anthropic",
+                            model=model,
+                            original_tokens=original_tokens,
+                            optimized_tokens=optimized_tokens,
+                            output_tokens=output_tokens,
+                            tokens_saved=tokens_saved,
+                            attempted_input_tokens=optimized_tokens + tokens_saved,
+                            cache_read_tokens=cr_tokens,
+                            cache_write_tokens=cw_tokens,
+                            cache_write_5m_tokens=cw_5m_tokens,
+                            cache_write_1h_tokens=cw_1h_tokens,
+                            uncached_input_tokens=uncached_input_tokens,
+                            total_latency_ms=total_latency,
+                            overhead_ms=optimization_latency,
+                            pipeline_timing=pipeline_timing,
+                            waste_signals=waste_signals_dict,
+                            transforms_applied=tuple(transforms_applied),
+                            num_messages=len(messages),
+                            tags=tags,
+                            turn_id=compute_turn_id(
+                                model, body.get("system"), body.get("messages")
+                            ),
+                            request_messages=messages if self.config.log_full_messages else None,
                         )
-
-                    # Structured perf log line for `headroom perf` analysis
-                    num_msgs = len(messages)
-                    resp_usage = resp_json.get("usage", {}) if resp_json else {}
-                    cr = resp_usage.get("cache_read_input_tokens", 0)
-                    cw = resp_usage.get("cache_creation_input_tokens", 0)
-                    chp = round(cr / (cr + cw) * 100) if (cr + cw) > 0 else 0
-                    timing_str = (
-                        " ".join(f"{k}={v:.0f}ms" for k, v in pipeline_timing.items())
-                        if pipeline_timing
-                        else ""
-                    )
-                    logger.info(
-                        f"[{request_id}] PERF "
-                        f"model={model} msgs={num_msgs} "
-                        f"tok_before={original_tokens} tok_after={optimized_tokens} "
-                        f"tok_saved={tokens_saved} "
-                        f"cache_read={cr} cache_write={cw} cache_hit_pct={chp} "
-                        f"opt_ms={optimization_latency:.0f} "
-                        f"transforms={_summarize_transforms(transforms_applied)}"
-                        f"{' timing=' + timing_str if timing_str else ''}"
                     )
 
                     # Remove compression headers since httpx already decompressed the response
@@ -2509,16 +2477,27 @@ class AnthropicHandlerMixin:
                 path_for_log="/v1/messages/batches",
             )
 
-            # Record metrics
-            await self.metrics.record_request(
-                provider="anthropic",
-                model="batch",
-                input_tokens=total_optimized_tokens,
-                output_tokens=0,
-                tokens_saved=total_tokens_saved,
-                latency_ms=optimization_latency,
-                overhead_ms=optimization_latency,
-                pipeline_timing=pipeline_timing,
+            # Batch create: tokens accumulated across all requests in
+            # the batch. The funnel records it as a single observation
+            # under the synthetic model name "batch" — same as
+            # pre-refactor, just routed through the canonical path so
+            # batch traffic appears in RequestLog + PERF (it didn't
+            # before — sites 4/5/6 were "metrics-only").
+            await self._record_request_outcome(
+                RequestOutcome(
+                    request_id=request_id,
+                    provider="anthropic",
+                    model="batch",
+                    original_tokens=total_original_tokens,
+                    optimized_tokens=total_optimized_tokens,
+                    output_tokens=0,
+                    tokens_saved=total_tokens_saved,
+                    attempted_input_tokens=total_optimized_tokens + total_tokens_saved,
+                    total_latency_ms=optimization_latency,
+                    overhead_ms=optimization_latency,
+                    pipeline_timing=pipeline_timing,
+                    num_messages=len(compressed_requests),
+                )
             )
 
             # Log compression stats
@@ -2588,6 +2567,7 @@ class AnthropicHandlerMixin:
         """
         from fastapi.responses import Response
 
+        request_id = await self._next_request_id()
         start_time = time.time()
         path = request.url.path
         url = f"{self.ANTHROPIC_API_URL}{path}"
@@ -2618,15 +2598,22 @@ class AnthropicHandlerMixin:
             content=body,
         )
 
-        # Track metrics
+        # Batch passthrough: no compression, no transforms — but we
+        # still record the request so dashboards see the upstream call
+        # happened. Same funnel as the other 5 anthropic sites.
         latency_ms = (time.time() - start_time) * 1000
-        await self.metrics.record_request(
-            provider="anthropic",
-            model="passthrough:batches",
-            input_tokens=0,
-            output_tokens=0,
-            tokens_saved=0,
-            latency_ms=latency_ms,
+        await self._record_request_outcome(
+            RequestOutcome(
+                request_id=request_id,
+                provider="anthropic",
+                model="passthrough:batches",
+                original_tokens=0,
+                optimized_tokens=0,
+                output_tokens=0,
+                tokens_saved=0,
+                attempted_input_tokens=0,
+                total_latency_ms=latency_ms,
+            )
         )
 
         # Remove compression headers
@@ -2699,6 +2686,7 @@ class AnthropicHandlerMixin:
 
         from headroom.ccr import BatchResultProcessor, get_batch_context_store
 
+        request_id = await self._next_request_id()
         start_time = time.time()
 
         # Forward request to get raw results
@@ -2785,15 +2773,22 @@ class AnthropicHandlerMixin:
 
         processed_content = "\n".join(processed_lines)
 
-        # Track metrics
+        # Batch results, post-CCR processing. Like the other batch
+        # sites, no token accounting but we record the request so it's
+        # visible in dashboards + headroom perf.
         latency_ms = (time.time() - start_time) * 1000
-        await self.metrics.record_request(
-            provider="anthropic",
-            model="batch:ccr-processed",
-            input_tokens=0,
-            output_tokens=0,
-            tokens_saved=0,
-            latency_ms=latency_ms,
+        await self._record_request_outcome(
+            RequestOutcome(
+                request_id=request_id,
+                provider="anthropic",
+                model="batch:ccr-processed",
+                original_tokens=0,
+                optimized_tokens=0,
+                output_tokens=0,
+                tokens_saved=0,
+                attempted_input_tokens=0,
+                total_latency_ms=latency_ms,
+            )
         )
 
         return Response(

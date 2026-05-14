@@ -7,9 +7,10 @@ disagreed on argument shape — 9 of 18 omitted ``cached=``, 7 of 18
 omitted ``attempted_input_tokens=``, only 4 sites emitted a structured
 PERF log at all. This module is the structural fix: every handler
 converges on building a :class:`RequestOutcome` at end-of-request and
-hands it to :meth:`HeadroomProxy._record_request_outcome`, which owns
-the four downstream effects (Prometheus, cost tracker, request logger,
-PERF log).
+hands it to :func:`emit_request_outcome` (also exposed as
+:meth:`HeadroomProxy._record_request_outcome`), which owns the four
+downstream effects (Prometheus, cost tracker, request logger, PERF
+log).
 
 Note: this is **output unification, not input unification**. Provider
 APIs (Anthropic ``/v1/messages``, OpenAI Responses WS, Gemini
@@ -24,8 +25,12 @@ actually reports.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
+
+logger = logging.getLogger("headroom.proxy")
 
 
 @dataclass(frozen=True)
@@ -75,6 +80,12 @@ class RequestOutcome:
     cache_write_1h_tokens: int = 0
     uncached_input_tokens: int = 0
     cache_inferred: bool = False
+    # Response-cache hit (Headroom's own semantic cache served the
+    # response from a prior call — completely distinct from
+    # upstream-prompt-cache `cache_read_tokens`). True means the proxy
+    # never reached the provider at all. Used to drive the
+    # Prometheus ``cached`` counter and dashboard "response cache" row.
+    from_response_cache: bool = False
 
     # ── Timing ────────────────────────────────────────────────────────
     # total_latency_ms: wall-clock end-to-end for this request
@@ -111,13 +122,18 @@ class RequestOutcome:
 
     @property
     def cache_hit(self) -> bool:
-        """True iff upstream reported any cache read.
+        """True iff EITHER upstream reported a cache read OR the response
+        was served from Headroom's own response cache.
 
-        Used by ``RequestLog.cache_hit`` and ``record_request(cached=...)``.
+        Two distinct concepts collapsed into one observable boolean for
+        downstream consumers (Prometheus ``cached`` counter, RequestLog
+        ``cache_hit`` flag). The dataclass tracks them separately so
+        dashboards can split them; the derived property unifies them.
+
         Pre-refactor 9 of 18 sites hardcoded this to False — this property
         makes "I forgot to compute it" structurally impossible.
         """
-        return self.cache_read_tokens > 0
+        return self.cache_read_tokens > 0 or self.from_response_cache
 
     @property
     def cache_hit_pct(self) -> int:
@@ -144,3 +160,106 @@ class RequestOutcome:
         if self.original_tokens <= 0:
             return 0.0
         return self.tokens_saved / self.original_tokens * 100.0
+
+
+# ── The funnel ───────────────────────────────────────────────────────
+
+
+async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
+    """Single funnel for per-request bookkeeping. The contract.
+
+    Owns the four downstream effects in canonical order:
+
+      1. ``handler.metrics.record_request(...)`` — Prometheus / SavingsTracker
+      2. ``handler.cost_tracker.record_tokens(...)`` — cost dashboard
+         (skipped when cost_tracker is None, i.e. ``--no-cost``)
+      3. ``handler.logger.log(RequestLog(...))`` — per-request log feed
+         (skipped when logger is None, i.e. ``--no-request-logging``)
+      4. structured PERF log line — consumed by ``headroom perf``
+
+    Takes the handler as a free argument rather than ``self`` so this
+    function is callable from:
+    * ``HeadroomProxy._record_request_outcome`` (production)
+    * any test dummy that has the three required attributes
+      (``metrics``, ``cost_tracker``, optionally ``logger``)
+    * any provider handler mixin
+
+    The handler argument is structurally typed (duck-typed); no formal
+    Protocol — the requirement is simply that ``handler.metrics`` exists
+    and is awaitable-compatible. We could lift this to a typing.Protocol
+    if/when another contract surface emerges, but YAGNI.
+    """
+    from headroom.proxy.cost import _summarize_transforms
+    from headroom.proxy.models import RequestLog
+
+    # 1. Prometheus / SavingsTracker.
+    await handler.metrics.record_request(
+        provider=outcome.provider,
+        model=outcome.model,
+        input_tokens=outcome.optimized_tokens,
+        output_tokens=outcome.output_tokens,
+        tokens_saved=outcome.tokens_saved,
+        latency_ms=outcome.total_latency_ms,
+        cached=outcome.cache_hit,
+        overhead_ms=outcome.overhead_ms,
+        ttfb_ms=outcome.ttfb_ms,
+        pipeline_timing=outcome.pipeline_timing,
+        waste_signals=outcome.waste_signals,
+        cache_read_tokens=outcome.cache_read_tokens,
+        cache_write_tokens=outcome.cache_write_tokens,
+        cache_write_5m_tokens=outcome.cache_write_5m_tokens,
+        cache_write_1h_tokens=outcome.cache_write_1h_tokens,
+        uncached_input_tokens=outcome.uncached_input_tokens,
+        attempted_input_tokens=outcome.attempted_input_tokens,
+    )
+
+    # 2. Cost tracker (optional).
+    cost_tracker = getattr(handler, "cost_tracker", None)
+    if cost_tracker is not None:
+        cost_tracker.record_tokens(
+            outcome.model,
+            outcome.tokens_saved,
+            outcome.optimized_tokens,
+            cache_read_tokens=outcome.cache_read_tokens,
+            cache_write_tokens=outcome.cache_write_tokens,
+            cache_write_5m_tokens=outcome.cache_write_5m_tokens,
+            cache_write_1h_tokens=outcome.cache_write_1h_tokens,
+            uncached_tokens=outcome.uncached_input_tokens,
+        )
+
+    # 3. Per-request log (optional).
+    request_logger = getattr(handler, "logger", None)
+    if request_logger is not None:
+        request_logger.log(
+            RequestLog(
+                request_id=outcome.request_id,
+                timestamp=datetime.now().isoformat(),
+                provider=outcome.provider,
+                model=outcome.model,
+                input_tokens_original=outcome.original_tokens,
+                input_tokens_optimized=outcome.optimized_tokens,
+                output_tokens=outcome.output_tokens,
+                tokens_saved=outcome.tokens_saved,
+                savings_percent=outcome.savings_pct,
+                optimization_latency_ms=outcome.overhead_ms,
+                total_latency_ms=outcome.total_latency_ms,
+                tags=outcome.tags,
+                cache_hit=outcome.cache_hit,
+                transforms_applied=list(outcome.transforms_applied),
+                waste_signals=outcome.waste_signals,
+                request_messages=outcome.request_messages,
+                turn_id=outcome.turn_id,
+            )
+        )
+
+    # 4. Structured PERF log line.
+    logger.info(
+        f"[{outcome.request_id}] PERF "
+        f"model={outcome.model} msgs={outcome.num_messages} "
+        f"tok_before={outcome.original_tokens} tok_after={outcome.optimized_tokens} "
+        f"tok_saved={outcome.tokens_saved} "
+        f"cache_read={outcome.cache_read_tokens} cache_write={outcome.cache_write_tokens} "
+        f"cache_hit_pct={outcome.cache_hit_pct} "
+        f"opt_ms={outcome.overhead_ms:.0f} "
+        f"transforms={_summarize_transforms(list(outcome.transforms_applied))}"
+    )
