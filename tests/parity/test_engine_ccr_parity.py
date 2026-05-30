@@ -126,7 +126,7 @@ def _build_ccr_engine_for_fixture(fix: GoldenFixture) -> Any:
     ccr = CCRComponents(
         ccr_context_tracker=None,
         get_compression_store=_EmptyCompressionStore,
-        turn_counter=[0],
+        session_turn_counters={},
     )
 
     engine = HeadroomEngine(

@@ -1,4 +1,4 @@
-"""HeadroomEngine — request/response hook facade (Chunk 2 + 4.2a/4.2b/4.2c).
+"""HeadroomEngine — request/response hook facade (Chunks 2 + 4.2a/4.2b/4.2c + 4.3-i).
 
 Composes the existing compression subsystems behind a clean hook interface.
 Does NOT reimplement compression; delegates to injected ``CompressionPipeline``
@@ -23,26 +23,18 @@ Design notes
   handler uses. Memory injection (4.2c) runs between compression tracking and
   proactive expansion — the ordering seam is clearly marked.
 - **Chunk 4.2c — memory injection**: when ``memory_components`` is provided,
-  the engine calls the synchronous ``fetch_context`` seam (injected by the
-  host) and appends the returned context string to the latest non-frozen user
-  turn (via the ported ``_append_context_to_latest_non_frozen_user_turn``
-  helper). Cache-mode and bypass requests skip injection. The engine never
-  ``await``s — the async search is the host's concern; the engine only handles
-  the deterministic placement step.
-
-  **4.3 async-bridge note** (decided here, implemented in 4.3):
-  In production the host (server.py) must satisfy ``fetch_context`` as a
-  *synchronous* callable. Two options for the async handler:
-    (a) Pre-fetch: ``await memory_handler.search_and_format_context(...)``
-        in the async handler body, then pass a ``lambda *_: result`` closure
-        to ``MemoryComponents``. This is the simplest strategy and avoids
-        any thread-pool gymnastics.
-    (b) Thread-pool bridge: ``asyncio.get_event_loop().run_in_executor(...)``
-        wrapping the coroutine, driven synchronously in the engine.
-  Option (a) is strongly preferred. It keeps the engine fully sync, puts the
-  await at the handler boundary where FastAPI/anyio already manage the event
-  loop, and has zero risk of deadlock. ``MemoryComponents`` is designed so
-  that option (a) is the natural fit: pre-fetch, then pass the result.
+  the engine reads ``RequestContext.prefetched_memory_context`` (pre-fetched by
+  the async handler before calling ``on_request``) and appends it to the latest
+  non-frozen user turn. Cache-mode and bypass requests skip injection. The
+  engine never ``await``s.
+- **Chunk 4.3-i — production component model**: component shapes refined for
+  multi-session production use. ``CCRComponents.session_turn_counters`` is now
+  a ``dict[str, int]`` keyed by session_id (per-session, not global).
+  ``MemoryComponents`` holds only per-proxy bits (``memory_handler`` +
+  ``default_user_id``); per-request memory context arrives via
+  ``RequestContext.prefetched_memory_context`` (option (a) async-bridge:
+  the async handler ``await``s the search, stores the result in
+  ``RequestContext``, then calls ``engine.on_request``).
 """
 
 from __future__ import annotations
@@ -113,60 +105,73 @@ class AnthropicComponents:
 
 
 class MemoryComponents:
-    """Injectable memory-injection components for the engine (Chunk 4.2c).
+    """Injectable memory-injection components for the engine (Chunk 4.2c / 4.3-i).
 
-    The engine owns the **injection** step (deterministic placement into the
-    latest non-frozen user turn). The **async search** is the host's concern —
-    it must be resolved to a plain string (or None) before calling
-    ``engine.on_request``, and handed to the engine via the synchronous
-    ``fetch_context`` seam.
+    **Production shape (4.3-i)**: holds only per-proxy bits.  Per-request
+    inputs arrive through ``RequestContext.prefetched_memory_context`` (the
+    pre-fetched context string) and ``RequestContext.headers_view``
+    (``x-headroom-user-id`` header → user-id derivation).
+
+    The async handler (4.3-ii) is responsible for:
+      1. Deriving ``memory_user_id`` from ``request.headers``.
+      2. ``await``-ing ``memory_handler.search_and_format_context(...)`` within
+         the async request scope.
+      3. Passing the result as ``RequestContext.prefetched_memory_context``.
+
+    The engine never ``await``s — it reads ``ctx.prefetched_memory_context``
+    directly and performs the synchronous placement step.
 
     When this is ``None`` on ``HeadroomEngine``, the memory step is a no-op
     (byte-identical to the pre-4.2c behaviour for all existing tests).
 
     Parameters
     ----------
-    fetch_context:
-        Synchronous callable with signature::
-
-            fetch_context(
-                messages: list[dict],
-                query: str,
-                ctx: RequestContext,
-            ) -> str | None
-
-        The engine calls this once per request (when the decision gate passes).
-        Return ``None`` or ``""`` to skip injection.  The callable MUST NOT
-        ``await`` — see the module-level 4.3 async-bridge note for how the
-        production host satisfies this seam.
     memory_handler:
-        The live memory handler instance (or ``None``). Used only for the
-        ``inject_context`` sub-gate check (``memory_handler.config.inject_context``).
+        The live memory handler instance (or ``None``). Used for:
+          - ``inject_context`` sub-gate (``memory_handler.config.inject_context``).
+          - Deriving the user-id fallback when the header is absent.
         Pass ``None`` to skip injection unconditionally (same as no components).
-    user_id:
-        Per-request user_id (from ``x-headroom-user-id`` or env default).
-        Empty string or ``None`` → injection gate fails → no-op.
+    default_user_id:
+        Fallback user-id when the ``x-headroom-user-id`` request header is
+        absent.  Mirrors the handler's ``os.environ.get("USER", ...)`` fallback.
+        Defaults to the ``USER`` / ``USERNAME`` env var, or ``"default"``.
     """
 
     def __init__(
         self,
         *,
-        fetch_context: Callable[[list[Any], str, Any], str | None],
         memory_handler: Any | None,
-        user_id: str | None,
+        default_user_id: str | None = None,
     ) -> None:
-        self.fetch_context = fetch_context
         self.memory_handler = memory_handler
-        self.user_id = user_id
+        if default_user_id is None:
+            import os as _os
+
+            self.default_user_id: str = _os.environ.get(
+                "USER", _os.environ.get("USERNAME", "default")
+            )
+        else:
+            # Explicit value (including "") is used as-is; empty string → gate fails.
+            self.default_user_id = default_user_id
 
 
 class CCRComponents:
-    """Injectable CCR request-side components for the engine (Chunk 4.2b).
+    """Injectable CCR request-side components for the engine (Chunk 4.2b / 4.3-i).
 
     When this is provided to ``HeadroomEngine``, the engine runs the full
     CCR request-side pipeline after compression-core. When ``None``, the
     CCR steps are skipped entirely (no-op), which preserves byte-identical
     output for all existing CCR-OFF fixtures.
+
+    **Production shape (4.3-i)**: the turn counter is now session-keyed via
+    ``session_turn_counters: dict[str, int]``.  The engine derives the
+    session_id from ``AnthropicComponents.session_tracker_store`` (same call
+    as for frozen-count), then increments
+    ``session_turn_counters[session_id]`` when compression tracking fires.
+    This is the correct production semantics: ``self._turn_counter`` on the
+    proxy handler was a single global int, which is incorrect for a
+    multi-session proxy (a new session starts counting from wherever the
+    previous session left off).
 
     Parameters
     ----------
@@ -178,13 +183,12 @@ class CCRComponents:
         Callable ``() -> CompressionStore`` — returns the store used for
         ``get_metadata(hash_key)`` lookups during compression tracking.
         Injected so tests can supply a stub store without touching the global.
-    turn_counter:
-        Mutable single-element list ``[int]`` used to share the turn counter
-        across CCR steps. The engine increments ``turn_counter[0]`` when
-        compression tracking fires. Callers pass ``[0]`` on first use;
-        the engine mutates in place so the counter accumulates across turns
-        within the same session (same behaviour as ``self._turn_counter``
-        on the proxy handler). Pass a new ``[0]`` per engine instance.
+    session_turn_counters:
+        Mutable ``dict[str, int]`` mapping session_id → per-session turn
+        counter.  The engine increments ``session_turn_counters[session_id]``
+        when compression tracking fires, creating the key on first use.
+        Callers pass an empty ``{}`` on construction; the engine mutates in
+        place so each session accumulates its own count independently.
     """
 
     def __init__(
@@ -192,13 +196,15 @@ class CCRComponents:
         *,
         ccr_context_tracker: Any | None,
         get_compression_store: Callable[[], Any],
-        turn_counter: list[int],
+        session_turn_counters: dict[str, int] | None = None,
     ) -> None:
         self.ccr_context_tracker = ccr_context_tracker
         self.get_compression_store = get_compression_store
-        # Mutable single-element list so tests/callers can inspect the count
-        # after engine invocations. The engine mutates turn_counter[0] in place.
-        self.turn_counter = turn_counter
+        # Per-session turn counters: session_id → count.
+        # The engine mutates this dict in place on each compression-tracking event.
+        self.session_turn_counters: dict[str, int] = (
+            session_turn_counters if session_turn_counters is not None else {}
+        )
 
 
 class HeadroomEngine:
@@ -594,14 +600,18 @@ class HeadroomEngine:
                 # tracked under empty key would be un-matchable in analyze_query.
                 if injector.has_compressed_content:
                     if ccr.ccr_context_tracker and ccr_workspace_key:
-                        ccr.turn_counter[0] += 1
+                        # Per-session turn counter: increment only for this session.
+                        ccr.session_turn_counters[session_id] = (
+                            ccr.session_turn_counters.get(session_id, 0) + 1
+                        )
+                        _session_turn = ccr.session_turn_counters[session_id]
                         for hash_key in injector.detected_hashes:
                             store = ccr.get_compression_store()
                             entry = store.get_metadata(hash_key)
                             if entry:
                                 ccr.ccr_context_tracker.track_compression(
                                     hash_key=hash_key,
-                                    turn_number=ccr.turn_counter[0],
+                                    turn_number=_session_turn,
                                     tool_name=entry.get("tool_name"),
                                     original_count=entry.get("original_item_count", 0),
                                     compressed_count=entry.get("compressed_item_count", 0),
@@ -618,20 +628,31 @@ class HeadroomEngine:
                             request_id,
                         )
 
-        # ── Memory injection (Chunk 4.2c) ────────────────────────────────────
+        # ── Memory injection (Chunk 4.2c / 4.3-i) ───────────────────────────
         # Runs AFTER compression tracking (step 3) and BEFORE proactive
         # expansion (step 4). Mirrors handler lines ~1424-1504.
         # When memory_components is None this entire block is skipped —
         # preserving byte-identical output for all pre-4.2c tests.
+        #
+        # Production seam (4.3-i): the async handler pre-fetches
+        # memory_handler.search_and_format_context and stores the result in
+        # ctx.prefetched_memory_context before calling engine.on_request.
+        # The engine reads that value here — no awaiting needed.
         mc = self._memory_components
         if mc is not None and not _bypass:
             from headroom.proxy.helpers import get_memory_injection_mode
             from headroom.proxy.memory_decision import MemoryDecision
 
+            # Derive user_id: x-headroom-user-id header → mc.default_user_id fallback.
+            # mc.default_user_id was set at MemoryComponents construction time
+            # (env var resolved then, not here) so no further env lookup is needed.
+            _header_user_id = dict(ctx.headers_view).get("x-headroom-user-id", "")
+            memory_user_id: str | None = _header_user_id if _header_user_id else mc.default_user_id
+
             mem_decision = MemoryDecision.decide(
                 headers=ctx.headers_view,
                 memory_handler=mc.memory_handler,
-                memory_user_id=mc.user_id,
+                memory_user_id=memory_user_id,
                 mode_name=get_memory_injection_mode(),
             )
             if mem_decision.inject:
@@ -640,10 +661,8 @@ class HeadroomEngine:
                     getattr(mc.memory_handler, "config", None), "inject_context", True
                 )
                 if _inject_ctx:
-                    from headroom.utils import extract_user_query as _extract_q
-
-                    _user_query = _extract_q(optimized_messages) or ""
-                    memory_context = mc.fetch_context(optimized_messages, _user_query, ctx)
+                    # Use the pre-fetched context from the request context.
+                    memory_context: str | None = ctx.prefetched_memory_context
                     if memory_context and not is_cache_mode(ac.config.mode):
                         optimized_messages = _append_context_to_latest_non_frozen_user_turn(
                             optimized_messages,
@@ -689,7 +708,7 @@ class HeadroomEngine:
             if user_query:
                 recommendations = ccr.ccr_context_tracker.analyze_query(
                     user_query,
-                    ccr.turn_counter[0],
+                    ccr.session_turn_counters.get(session_id, 0),
                     workspace_key=ccr_workspace_key,
                 )
                 if recommendations:

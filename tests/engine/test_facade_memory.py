@@ -41,15 +41,18 @@ _FIXED_CONTEXT = (
 
 def _make_engine(
     *,
-    fetch_context: Any | None = None,
     memory_handler: Any | None = None,
-    user_id: str | None = "test-user",
+    with_memory: bool = True,
     config_overrides: dict[str, Any] | None = None,
     frozen_count: int = 0,
     ccr_context_tracker: Any | None = None,
     ccr_config_overrides: dict[str, Any] | None = None,
 ) -> Any:
-    """Build a HeadroomEngine with MemoryComponents for structural/byte-exact tests."""
+    """Build a HeadroomEngine with MemoryComponents for structural/byte-exact tests.
+
+    4.3-i shape: MemoryComponents holds only per-proxy bits (memory_handler).
+    Per-request context is supplied via RequestContext.prefetched_memory_context.
+    """
     from headroom.engine.contract import Flavor, Provider
     from headroom.engine.facade import (
         AnthropicComponents,
@@ -125,18 +128,16 @@ def _make_engine(
     )
 
     mc = None
-    if fetch_context is not None or user_id is not None:
+    if with_memory:
         _handler = memory_handler
         if _handler is None:
             # Default stub: has inject_context=True
             _handler = MagicMock()
             _handler.config.inject_context = True
 
-        _fetch = fetch_context if fetch_context is not None else (lambda *_: None)
         mc = MemoryComponents(
-            fetch_context=_fetch,
             memory_handler=_handler,
-            user_id=user_id,
+            default_user_id="test-user",
         )
 
     ccr = None
@@ -144,7 +145,7 @@ def _make_engine(
         ccr = CCRComponents(
             ccr_context_tracker=ccr_context_tracker,
             get_compression_store=lambda: MagicMock(),
-            turn_counter=[0],
+            session_turn_counters={},
         )
 
     engine = HeadroomEngine(
@@ -164,8 +165,13 @@ def _make_ctx(
     *,
     headers: dict[str, str] | None = None,
     cwd: str | None = None,
+    prefetched_memory_context: str | None = None,
 ) -> Any:
-    """Build a RequestContext for structural tests."""
+    """Build a RequestContext for structural tests.
+
+    4.3-i: pass ``prefetched_memory_context`` to supply the pre-fetched
+    memory context string (option (a) async-bridge pattern).
+    """
     from headroom.engine.contract import Flavor, Provider, RequestContext
 
     h: dict[str, str] = {
@@ -185,6 +191,7 @@ def _make_ctx(
         raw_body=json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode(),
         session_key="memory-structural",
         request_id="req-mem-test",
+        prefetched_memory_context=prefetched_memory_context,
     )
 
 
@@ -288,21 +295,17 @@ def test_memory_injection_string_content_token_mode() -> None:
     """Memory-on: context is appended to the latest user turn (string content).
 
     The injected text must appear as ``original_text + "\\n\\n" + context``.
+
+    4.3-i: prefetched_memory_context is passed via RequestContext (option (a)).
     """
-    call_log: list[tuple[list, str]] = []
-
-    def _fetch(messages: list, query: str, ctx: Any) -> str:
-        call_log.append((messages, query))
-        return _FIXED_CONTEXT
-
     user_text = "How does authentication work?"
     body = {
         "model": "claude-sonnet-4-6",
         "max_tokens": 64,
         "messages": [{"role": "user", "content": user_text}],
     }
-    ctx = _make_ctx(body)
-    engine = _make_engine(fetch_context=_fetch)
+    ctx = _make_ctx(body, prefetched_memory_context=_FIXED_CONTEXT)
+    engine = _make_engine()
     decision = engine.on_request(ctx)
 
     out = json.loads(decision.body)
@@ -312,18 +315,12 @@ def test_memory_injection_string_content_token_mode() -> None:
     assert isinstance(content, str)
     assert content == user_text + "\n\n" + _FIXED_CONTEXT
 
-    # fetch_context must have been called once
-    assert len(call_log) == 1
-    _, called_query = call_log[0]
-    assert called_query == user_text
-
 
 def test_memory_injection_list_content_token_mode() -> None:
-    """Memory-on: context is appended to the first text block (list content)."""
+    """Memory-on: context is appended to the first text block (list content).
 
-    def _fetch(messages: list, query: str, ctx: Any) -> str:
-        return _FIXED_CONTEXT
-
+    4.3-i: prefetched_memory_context is passed via RequestContext.
+    """
     original_text = "What is the rate limit policy?"
     body = {
         "model": "claude-sonnet-4-6",
@@ -338,8 +335,8 @@ def test_memory_injection_list_content_token_mode() -> None:
             }
         ],
     }
-    ctx = _make_ctx(body)
-    engine = _make_engine(fetch_context=_fetch)
+    ctx = _make_ctx(body, prefetched_memory_context=_FIXED_CONTEXT)
+    engine = _make_engine()
     decision = engine.on_request(ctx)
 
     out = json.loads(decision.body)
@@ -357,27 +354,20 @@ def test_memory_injection_list_content_token_mode() -> None:
 
 
 def test_memory_injection_skipped_in_cache_mode() -> None:
-    """Cache mode: injection is skipped to preserve prefix stability."""
-    fetch_called = [False]
+    """Cache mode: injection is skipped to preserve prefix stability.
 
-    def _fetch(messages: list, query: str, ctx: Any) -> str:
-        fetch_called[0] = True
-        return _FIXED_CONTEXT
-
+    4.3-i: even when prefetched_memory_context is set, the engine skips
+    injection in cache mode (the is_cache_mode gate inside the engine).
+    """
     body = {
         "model": "claude-sonnet-4-6",
         "max_tokens": 64,
         "messages": [{"role": "user", "content": "Cache mode test"}],
     }
-    ctx = _make_ctx(body)
-    engine = _make_engine(
-        fetch_context=_fetch,
-        config_overrides={"mode": "cache"},
-    )
+    # Supply pre-fetched context; the engine should NOT inject it in cache mode.
+    ctx = _make_ctx(body, prefetched_memory_context=_FIXED_CONTEXT)
+    engine = _make_engine(config_overrides={"mode": "cache"})
     decision = engine.on_request(ctx)
-
-    # fetch_context is called (gate passes), but injection is skipped.
-    assert fetch_called[0] is True
 
     out = json.loads(decision.body)
     last_msg = out["messages"][-1]
@@ -402,11 +392,9 @@ def test_memory_injection_respects_frozen_boundary() -> None:
 
     The body has two user turns: [turn0 (frozen), turn1 (live)].
     With frozen_count=1, turn0 is off-limits; context should land in turn1.
+
+    4.3-i: prefetched_memory_context is passed via RequestContext.
     """
-
-    def _fetch(messages: list, query: str, ctx: Any) -> str:
-        return _FIXED_CONTEXT
-
     body = {
         "model": "claude-sonnet-4-6",
         "max_tokens": 64,
@@ -416,10 +404,10 @@ def test_memory_injection_respects_frozen_boundary() -> None:
             {"role": "user", "content": "Live turn — inject here"},
         ],
     }
-    ctx = _make_ctx(body)
+    ctx = _make_ctx(body, prefetched_memory_context=_FIXED_CONTEXT)
     # frozen_count=1 means the first message (index 0) is frozen; messages 1+ are live.
     # With 3 messages (indices 0,1,2) and frozen_count=1, index 2 (last user) is live.
-    engine = _make_engine(fetch_context=_fetch, frozen_count=1)
+    engine = _make_engine(frozen_count=1)
     decision = engine.on_request(ctx)
 
     out = json.loads(decision.body)
@@ -458,18 +446,18 @@ def test_append_context_helper_skips_fully_frozen_messages() -> None:
 
 
 def test_memory_injection_skipped_on_empty_context() -> None:
-    """Empty string from fetch_context → no injection."""
+    """Empty string prefetched_memory_context → no injection.
 
-    def _fetch(messages: list, query: str, ctx: Any) -> str:
-        return ""
-
+    4.3-i: the engine skips injection when ctx.prefetched_memory_context is "".
+    """
     body = {
         "model": "claude-sonnet-4-6",
         "max_tokens": 64,
         "messages": [{"role": "user", "content": "Hello"}],
     }
-    ctx = _make_ctx(body)
-    engine = _make_engine(fetch_context=_fetch)
+    # Explicit empty string → no injection.
+    ctx = _make_ctx(body, prefetched_memory_context="")
+    engine = _make_engine()
     decision = engine.on_request(ctx)
 
     out = json.loads(decision.body)
@@ -478,18 +466,18 @@ def test_memory_injection_skipped_on_empty_context() -> None:
 
 
 def test_memory_injection_skipped_on_none_context() -> None:
-    """None from fetch_context → no injection."""
+    """None prefetched_memory_context → no injection.
 
-    def _fetch(messages: list, query: str, ctx: Any) -> str | None:
-        return None
-
+    4.3-i: the engine skips injection when ctx.prefetched_memory_context is None.
+    """
     body = {
         "model": "claude-sonnet-4-6",
         "max_tokens": 64,
         "messages": [{"role": "user", "content": "Hello"}],
     }
-    ctx = _make_ctx(body)
-    engine = _make_engine(fetch_context=_fetch)
+    # None (default) → no injection.
+    ctx = _make_ctx(body, prefetched_memory_context=None)
+    engine = _make_engine()
     decision = engine.on_request(ctx)
 
     out = json.loads(decision.body)
@@ -511,6 +499,8 @@ def test_memory_and_ccr_expansion_ordering() -> None:
     twice: first with memory context, then with expansion text). The final
     content must contain both strings, with the memory context appearing
     first in the text.
+
+    4.3-i: prefetched_memory_context is passed via RequestContext.
     """
     expansion_text = "[CCR EXPANSION] Relevant context: retrieved_content"
 
@@ -519,18 +509,14 @@ def test_memory_and_ccr_expansion_ordering() -> None:
     mock_tracker.execute_expansions.return_value = [MagicMock(content="retrieved_content")]
     mock_tracker.format_expansions_for_context.return_value = expansion_text
 
-    def _fetch(messages: list, query: str, ctx: Any) -> str:
-        return _FIXED_CONTEXT
-
     user_text = "Where is authentication configured?"
     body = {
         "model": "claude-sonnet-4-6",
         "max_tokens": 128,
         "messages": [{"role": "user", "content": user_text}],
     }
-    ctx = _make_ctx(body, cwd="/home/user/myproject")
+    ctx = _make_ctx(body, cwd="/home/user/myproject", prefetched_memory_context=_FIXED_CONTEXT)
     engine = _make_engine(
-        fetch_context=_fetch,
         ccr_context_tracker=mock_tracker,
         ccr_config_overrides={
             "ccr_inject_tool": False,
@@ -559,18 +545,17 @@ def test_memory_and_ccr_expansion_ordering() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 7. structural: fetch_context call args
+# 7. structural: prefetched_memory_context passthrough
 # ---------------------------------------------------------------------------
 
 
-def test_fetch_context_called_with_correct_args() -> None:
-    """fetch_context receives (messages, query, ctx) with correct values."""
-    call_args_log: list[tuple[list, str, Any]] = []
+def test_prefetched_memory_context_placed_in_latest_user_turn() -> None:
+    """Engine places ctx.prefetched_memory_context into the latest non-frozen user turn.
 
-    def _fetch(messages: list, query: str, ctx: Any) -> str:
-        call_args_log.append((messages, query, ctx))
-        return _FIXED_CONTEXT
-
+    4.3-i: the engine reads ctx.prefetched_memory_context directly; no
+    fetch_context callable is needed. This test verifies end-to-end placement
+    for a multi-turn body (assistant turn before the live user turn).
+    """
     user_text = "What is the deployment process?"
     body = {
         "model": "claude-sonnet-4-6",
@@ -580,21 +565,19 @@ def test_fetch_context_called_with_correct_args() -> None:
             {"role": "user", "content": user_text},
         ],
     }
-    ctx = _make_ctx(body)
-    engine = _make_engine(fetch_context=_fetch)
-    engine.on_request(ctx)
+    ctx = _make_ctx(body, prefetched_memory_context=_FIXED_CONTEXT)
+    engine = _make_engine()
+    decision = engine.on_request(ctx)
 
-    assert len(call_args_log) == 1
-    called_messages, called_query, called_ctx = call_args_log[0]
-
-    # query should be the user turn text
-    assert called_query == user_text
-    # messages is a list of dicts
-    assert isinstance(called_messages, list)
-    # ctx is the RequestContext (engine passes it through)
-    from headroom.engine.contract import RequestContext
-
-    assert isinstance(called_ctx, RequestContext)
+    out = json.loads(decision.body)
+    msgs = out["messages"]
+    # Context must land in the last (user) turn.
+    last_msg = msgs[-1]
+    assert last_msg["role"] == "user"
+    assert _FIXED_CONTEXT in last_msg["content"]
+    # Assistant turn is unchanged.
+    assert msgs[0]["role"] == "assistant"
+    assert _FIXED_CONTEXT not in msgs[0]["content"]
 
 
 # ---------------------------------------------------------------------------
@@ -603,25 +586,28 @@ def test_fetch_context_called_with_correct_args() -> None:
 
 
 def test_memory_injection_skipped_on_bypass() -> None:
-    """x-headroom-bypass: true → memory injection is skipped."""
-    fetch_called = [False]
+    """x-headroom-bypass: true → memory injection is skipped.
 
-    def _fetch(messages: list, query: str, ctx: Any) -> str:
-        fetch_called[0] = True
-        return _FIXED_CONTEXT
-
+    4.3-i: even when prefetched_memory_context is set, bypass returns the
+    original bytes byte-identical before reaching the memory block.
+    """
     body = {
         "model": "claude-sonnet-4-6",
         "max_tokens": 64,
         "messages": [{"role": "user", "content": "Bypass test"}],
     }
-    ctx = _make_ctx(body, headers={"x-headroom-bypass": "true"})
-    engine = _make_engine(fetch_context=_fetch)
+    ctx = _make_ctx(
+        body,
+        headers={"x-headroom-bypass": "true"},
+        prefetched_memory_context=_FIXED_CONTEXT,
+    )
+    engine = _make_engine()
     decision = engine.on_request(ctx)
 
     # Bypass short-circuits before memory — original bytes returned.
     assert decision.body == ctx.raw_body
-    assert not fetch_called[0], "fetch_context must not be called under bypass"
+    # Context must NOT appear in the returned body.
+    assert _FIXED_CONTEXT.encode() not in decision.body
 
 
 # ---------------------------------------------------------------------------
@@ -630,13 +616,11 @@ def test_memory_injection_skipped_on_bypass() -> None:
 
 
 def test_memory_injection_skipped_when_inject_context_false() -> None:
-    """memory_handler.config.inject_context=False → injection skipped."""
-    fetch_called = [False]
+    """memory_handler.config.inject_context=False → injection skipped.
 
-    def _fetch(messages: list, query: str, ctx: Any) -> str:
-        fetch_called[0] = True
-        return _FIXED_CONTEXT
-
+    4.3-i: even when prefetched_memory_context is set, the inject_context
+    sub-gate on the handler config prevents placement.
+    """
     handler_mock = MagicMock()
     handler_mock.config.inject_context = False
 
@@ -645,15 +629,13 @@ def test_memory_injection_skipped_when_inject_context_false() -> None:
         "max_tokens": 64,
         "messages": [{"role": "user", "content": "No inject_context test"}],
     }
-    ctx = _make_ctx(body)
-    engine = _make_engine(fetch_context=_fetch, memory_handler=handler_mock)
+    ctx = _make_ctx(body, prefetched_memory_context=_FIXED_CONTEXT)
+    engine = _make_engine(memory_handler=handler_mock)
     decision = engine.on_request(ctx)
 
     out = json.loads(decision.body)
     content = out["messages"][-1]["content"]
     assert _FIXED_CONTEXT not in content
-    # fetch_context should not be called when inject_context is False
-    assert not fetch_called[0]
 
 
 # ---------------------------------------------------------------------------
@@ -662,23 +644,102 @@ def test_memory_injection_skipped_when_inject_context_false() -> None:
 
 
 def test_memory_injection_skipped_when_no_user_id() -> None:
-    """user_id=None or empty → MemoryDecision.inject=False → no injection."""
-    fetch_called = [False]
+    """No user_id → MemoryDecision.inject=False → no injection.
 
-    def _fetch(messages: list, query: str, ctx: Any) -> str:
-        fetch_called[0] = True
-        return _FIXED_CONTEXT
+    4.3-i: supply a MemoryComponents with default_user_id="" (empty) and no
+    x-headroom-user-id header.  MemoryDecision.decide gates on memory_user_id
+    being non-empty, so injection is skipped even when prefetched_memory_context
+    is set.
+    """
+    from unittest.mock import MagicMock as _MM
 
+    from headroom.engine.facade import MemoryComponents
+
+    handler_mock = _MM()
+    handler_mock.config.inject_context = True
+
+    # Build engine with empty default_user_id so the gate fails.
+    # We pass through _make_engine then patch memory_components.
     body = {
         "model": "claude-sonnet-4-6",
         "max_tokens": 64,
         "messages": [{"role": "user", "content": "No user_id test"}],
     }
-    ctx = _make_ctx(body)
-    engine = _make_engine(fetch_context=_fetch, user_id=None)
+    # No x-headroom-user-id header; default_user_id="" → gate fails.
+    ctx = _make_ctx(body, prefetched_memory_context=_FIXED_CONTEXT)
+
+    # Build engine without the helper to supply explicit empty default_user_id.
+    from headroom.engine.contract import Flavor, Provider
+    from headroom.engine.facade import AnthropicComponents, HeadroomEngine
+    from headroom.proxy.models import ProxyConfig
+    from headroom.proxy.server import HeadroomProxy
+
+    config = ProxyConfig(
+        optimize=True,
+        mode="token",
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        image_optimize=False,
+    )
+    proxy = HeadroomProxy(config)
+
+    class _S:
+        def compute_session_id(self, *a: Any, **kw: Any) -> str:
+            return "s"
+
+        def get_or_create(self, *a: Any, **kw: Any) -> Any:
+            class _T:
+                def get_frozen_message_count(self) -> int:
+                    return 0
+
+                def get_last_original_messages(self) -> list:
+                    return []
+
+                def get_last_forwarded_messages(self) -> list:
+                    return []
+
+            return _T()
+
+        def get_fresh_cache(self, sid: str) -> Any:
+            class _C:
+                def apply_cached(self, m: list) -> list:
+                    return list(m)
+
+                def compute_frozen_count(self, m: list) -> int:
+                    return 0
+
+                def update_from_result(self, *a: Any) -> None:
+                    pass
+
+                def mark_stable_from_messages(self, *a: Any) -> None:
+                    pass
+
+            return _C()
+
+    ac = AnthropicComponents(
+        pipeline=proxy.anthropic_pipeline,
+        provider=proxy.anthropic_provider,
+        session_tracker_store=_S(),
+        get_compression_cache=_S().get_fresh_cache,
+        config=proxy.config,
+        usage_reporter=None,
+    )
+    mc = MemoryComponents(
+        memory_handler=handler_mock,
+        default_user_id="",  # empty → MemoryDecision gate fails
+    )
+    engine = HeadroomEngine(
+        pipelines={(Provider.ANTHROPIC, Flavor.MESSAGES): proxy.anthropic_pipeline},
+        config=proxy.config,
+        usage_reporter=None,
+        salt=b"s",
+        anthropic_components=ac,
+        memory_components=mc,
+    )
     decision = engine.on_request(ctx)
 
     out = json.loads(decision.body)
     content = out["messages"][-1]["content"]
     assert _FIXED_CONTEXT not in content
-    assert not fetch_called[0]

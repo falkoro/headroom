@@ -40,7 +40,7 @@ def _make_engine(
     *,
     ccr_context_tracker: Any | None = None,
     get_compression_store: Any | None = None,
-    turn_counter: list[int] | None = None,
+    session_turn_counters: dict[str, int] | None = None,
     config_overrides: dict[str, Any] | None = None,
     frozen_count: int = 0,
 ) -> Any:
@@ -117,7 +117,7 @@ def _make_engine(
     ccr = CCRComponents(
         ccr_context_tracker=ccr_context_tracker,
         get_compression_store=store,
-        turn_counter=turn_counter if turn_counter is not None else [0],
+        session_turn_counters=session_turn_counters if session_turn_counters is not None else {},
     )
 
     engine = HeadroomEngine(
@@ -275,12 +275,12 @@ def test_compression_tracking_called_with_correct_args() -> None:
         "compressed_content": "auth_middleware.py\nauth_router.py\n",
     }
 
-    turn_counter = [0]
+    session_turn_counters: dict[str, int] = {}
 
     engine = _make_engine(
         ccr_context_tracker=mock_tracker,
         get_compression_store=lambda: mock_store,
-        turn_counter=turn_counter,
+        session_turn_counters=session_turn_counters,
         config_overrides={
             "ccr_inject_tool": True,
             "ccr_inject_system_instructions": False,
@@ -309,8 +309,14 @@ def test_compression_tracking_called_with_correct_args() -> None:
 
     engine.on_request(ctx)
 
-    # turn_counter should have been bumped from 0 to 1.
-    assert turn_counter[0] == 1
+    # session_turn_counters should have a non-zero entry for the test session.
+    # The session key is produced by _FixedStore.compute_session_id → "ccr-structural-test-session".
+    assert "ccr-structural-test-session" in session_turn_counters, (
+        "session_turn_counters must contain the test session key after a compression event"
+    )
+    assert session_turn_counters["ccr-structural-test-session"] == 1, (
+        "Turn counter for this session must be 1 after the first compression event"
+    )
 
     # get_metadata should have been called for the test hash.
     mock_store.get_metadata.assert_called_once_with(_CCR_TEST_HASH)
@@ -343,12 +349,12 @@ def test_compression_tracking_skipped_when_no_workspace() -> None:
         "query_context": "",
         "compressed_content": "",
     }
-    turn_counter = [0]
+    session_turn_counters: dict[str, int] = {}
 
     engine = _make_engine(
         ccr_context_tracker=mock_tracker,
         get_compression_store=lambda: mock_store,
-        turn_counter=turn_counter,
+        session_turn_counters=session_turn_counters,
         config_overrides={
             "ccr_inject_tool": True,
             "ccr_inject_system_instructions": False,
@@ -372,8 +378,10 @@ def test_compression_tracking_skipped_when_no_workspace() -> None:
 
     engine.on_request(ctx)
 
-    # turn_counter is NOT bumped (gated on workspace_key).
-    assert turn_counter[0] == 0
+    # session_turn_counters is NOT incremented (gated on workspace_key).
+    assert session_turn_counters.get("ccr-structural-test-session", 0) == 0, (
+        "Turn counter must not be incremented when workspace is unresolvable"
+    )
     # track_compression is NOT called (fail-closed).
     mock_tracker.track_compression.assert_not_called()
 
@@ -382,12 +390,12 @@ def test_compression_tracking_skipped_when_no_ccr_marker() -> None:
     """Step 3: track_compression is NOT called when no compression marker present."""
     mock_tracker = MagicMock()
     mock_store = MagicMock()
-    turn_counter = [0]
+    session_turn_counters: dict[str, int] = {}
 
     engine = _make_engine(
         ccr_context_tracker=mock_tracker,
         get_compression_store=lambda: mock_store,
-        turn_counter=turn_counter,
+        session_turn_counters=session_turn_counters,
         config_overrides={
             "ccr_inject_tool": True,
             "ccr_inject_system_instructions": False,
@@ -405,7 +413,7 @@ def test_compression_tracking_skipped_when_no_ccr_marker() -> None:
 
     engine.on_request(ctx)
 
-    assert turn_counter[0] == 0
+    assert session_turn_counters.get("ccr-structural-test-session", 0) == 0
     mock_tracker.track_compression.assert_not_called()
     mock_store.get_metadata.assert_not_called()
 

@@ -32,6 +32,12 @@ class RequestContext:
     raw_body: bytes
     session_key: str
     request_id: str = ""
+    # Optional pre-fetched memory context (option (a) async-bridge pattern).
+    # The async handler awaits memory_handler.search_and_format_context, then
+    # passes the result here before calling engine.on_request.  The engine
+    # uses this value directly — no sync/async gymnastics inside the engine.
+    # None → memory injection is a no-op for this request.
+    prefetched_memory_context: str | None = None
 
     def __post_init__(self) -> None:
         # Snapshot headers at the engine boundary: copy to isolate from later caller
