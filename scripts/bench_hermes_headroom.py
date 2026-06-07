@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Compare plain Hermes vs Headroom→Hermes token usage on /v1/chat/completions.
 
-Designed for spot-tech-ci (Hermes llm-proxy on :38765) but works on any host
-where Hermes is reachable.
+Uses agent-shaped workloads (large ``role: tool`` outputs) — the shape
+Headroom SmartCrusher actually compresses. Plain user/system log filler does
+not trigger savings.
 
 Examples::
 
@@ -23,10 +24,14 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
+
+# Shared workloads live under tests/test_cli for pytest parity.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests" / "test_cli"))
+from hermes_workloads import agent_tool_messages, multi_turn_agent_messages  # noqa: E402
 
 DEFAULT_HERMES_BASE = os.environ.get("HEADROOM_HERMES_BASE_URL", "http://127.0.0.1:38765/v1")
 DEFAULT_MODEL = os.environ.get("HEADROOM_HERMES_MODEL", "grok-4.3")
-REPLY_TOKEN = "BENCH_OK"
 
 
 def pick_port() -> int:
@@ -44,29 +49,7 @@ def hermes_health_ok(base_v1: str) -> bool:
         return False
 
 
-def fat_system_prompt(repeats: int = 80) -> str:
-    chunk = (
-        "TOOL_OUTPUT chunk=42 status=ok lines=500 "
-        "payload=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "
-        "stacktrace=Error at module.ts:128 in handleRequest "
-        "notes=repeatable compressible log filler for headroom bench "
-    )
-    return (
-        "You are a benchmark assistant. Ignore the filler below except to answer briefly.\n\n"
-        + (chunk + "\n") * repeats
-    )
-
-
-def log_block(turn: int) -> str:
-    return (
-        f"TOOL_OUTPUT turn={turn} status=ok lines=200 "
-        f"payload={'x' * 120} "
-        f"trace=Error at svc.ts:{100 + turn} in handleBatch "
-        f"notes=compressible repeated agent log block {turn}\n"
-    )
-
-
-def chat(base_url: str, messages: list[dict], model: str, max_tokens: int = 16) -> dict:
+def chat(base_url: str, messages: list[dict], model: str, max_tokens: int = 24) -> dict:
     payload = {
         "model": model,
         "messages": messages,
@@ -111,19 +94,27 @@ def headroom_argv() -> list[str]:
     return ["uv", "run", "headroom"]
 
 
-def run_single_turn(hermes_base: str, model: str) -> dict:
-    messages = [
-        {"role": "system", "content": fat_system_prompt()},
-        {"role": "user", "content": f"Reply with exactly one word: {REPLY_TOKEN}"},
-    ]
+def _delta_block(plain_usage: dict, wrapped_usage: dict, token_stats: dict, stats: dict) -> dict:
+    plain_in = int(plain_usage.get("prompt_tokens") or 0)
+    wrap_in = int(wrapped_usage.get("prompt_tokens") or 0)
+    saved = int(token_stats.get("saved") or 0)
+    return {
+        "plain_prompt_tokens": plain_in,
+        "headroom_prompt_tokens": wrap_in,
+        "upstream_prompt_token_delta": plain_in - wrap_in,
+        "headroom_tokens_saved": saved,
+        "tokens_saved_by_strategy": stats.get("tokens_saved_by_strategy") or {},
+        "compression_summary": stats.get("summary", {}).get("compression") or {},
+    }
+
+
+def run_agent_tool_turn(hermes_base: str, model: str) -> dict:
+    messages = agent_tool_messages()
     plain = chat(hermes_base, messages, model)
     plain_usage = plain.get("usage") or {}
 
     port = pick_port()
-    env = {
-        **dict(os.environ),
-        "HEADROOM_TELEMETRY": "off",
-    }
+    env = {**dict(os.environ), "HEADROOM_TELEMETRY": "off"}
     proc = subprocess.Popen(
         [
             *headroom_argv(),
@@ -144,8 +135,9 @@ def run_single_turn(hermes_base: str, model: str) -> dict:
         wrapped_usage = wrapped.get("usage") or {}
         stats = fetch_stats(port)
         token_stats = stats.get("tokens") or {}
+        delta = _delta_block(plain_usage, wrapped_usage, token_stats, stats)
         return {
-            "mode": "single-turn",
+            "mode": "agent-tool",
             "plain": {
                 "content": plain["choices"][0]["message"]["content"].strip(),
                 "usage": plain_usage,
@@ -158,11 +150,7 @@ def run_single_turn(hermes_base: str, model: str) -> dict:
                 "tokens_saved": token_stats.get("saved"),
                 "proxy_compression_saved": token_stats.get("proxy_compression_saved"),
             },
-            "delta": {
-                "plain_prompt_tokens": int(plain_usage.get("prompt_tokens") or 0),
-                "headroom_prompt_tokens": int(wrapped_usage.get("prompt_tokens") or 0),
-                "headroom_tokens_saved": int(token_stats.get("saved") or 0),
-            },
+            "delta": delta,
         }
     finally:
         proc.terminate()
@@ -172,33 +160,18 @@ def run_single_turn(hermes_base: str, model: str) -> dict:
             proc.kill()
 
 
-def run_multi_turn(hermes_base: str, model: str, turns: int = 4, log_blocks: int = 60) -> dict:
-    def conversation(base_url: str) -> dict:
-        messages: list[dict] = [
-            {
-                "role": "system",
-                "content": "Short answers only. You are running a multi-turn benchmark.",
-            }
-        ]
-        usages: list[dict] = []
-        for turn in range(1, turns + 1):
-            messages.append(
-                {
-                    "role": "user",
-                    "content": log_block(turn) * log_blocks + f"\nTurn {turn}: reply TURN_{turn}",
-                }
-            )
-            body = chat(base_url, messages, model, max_tokens=12)
-            reply = body["choices"][0]["message"]["content"].strip()
-            messages.append({"role": "assistant", "content": reply})
-            usages.append(body.get("usage") or {})
+def run_multi_turn(hermes_base: str, model: str, turns: int = 3) -> dict:
+    messages = multi_turn_agent_messages(turns=turns)
+
+    def final_turn(base_url: str) -> dict:
+        body = chat(base_url, messages, model, max_tokens=16)
         return {
-            "turn_usages": usages,
-            "final_prompt_tokens": int(usages[-1].get("prompt_tokens") or 0),
-            "sum_prompt_tokens": sum(int(u.get("prompt_tokens") or 0) for u in usages),
+            "content": body["choices"][0]["message"]["content"].strip(),
+            "usage": body.get("usage") or {},
+            "backend": body.get("_backend"),
         }
 
-    plain = conversation(hermes_base)
+    plain = final_turn(hermes_base)
     port = pick_port()
     env = {**dict(os.environ), "HEADROOM_TELEMETRY": "off"}
     proc = subprocess.Popen(
@@ -217,21 +190,19 @@ def run_multi_turn(hermes_base: str, model: str, turns: int = 4, log_blocks: int
     )
     try:
         wait_proxy_ready(port)
-        wrapped = conversation(f"http://127.0.0.1:{port}/v1")
+        wrapped = final_turn(f"http://127.0.0.1:{port}/v1")
         stats = fetch_stats(port)
         token_stats = stats.get("tokens") or {}
-        wrapped["headroom_tokens_saved"] = token_stats.get("saved")
+        delta = _delta_block(plain["usage"], wrapped["usage"], token_stats, stats)
         return {
-            "mode": "multi-turn",
+            "mode": "multi-turn-agent-tool",
+            "turns": turns,
             "plain": plain,
-            "headroom": wrapped,
-            "delta": {
-                "plain_final_prompt_tokens": plain["final_prompt_tokens"],
-                "headroom_final_prompt_tokens": wrapped["final_prompt_tokens"],
-                "plain_sum_prompt_tokens": plain["sum_prompt_tokens"],
-                "headroom_sum_prompt_tokens": wrapped["sum_prompt_tokens"],
-                "headroom_tokens_saved": int(token_stats.get("saved") or 0),
+            "headroom": {
+                **wrapped,
+                "tokens_saved": token_stats.get("saved"),
             },
+            "delta": delta,
         }
     finally:
         proc.terminate()
@@ -252,7 +223,7 @@ def main() -> int:
     parser.add_argument(
         "--multi-turn",
         action="store_true",
-        help="Run a 4-turn agent-style loop instead of a single fat prompt",
+        help="Run a multi-turn agent loop with tool outputs per turn",
     )
     args = parser.parse_args()
     hermes_base = args.hermes_base.rstrip("/")
@@ -265,13 +236,22 @@ def main() -> int:
         result = (
             run_multi_turn(hermes_base, args.model)
             if args.multi_turn
-            else run_single_turn(hermes_base, args.model)
+            else run_agent_tool_turn(hermes_base, args.model)
         )
     except urllib.error.URLError as exc:
         print(f"Request failed: {exc}", file=sys.stderr)
         return 1
 
     print(json.dumps(result, indent=2))
+    delta = result.get("delta") or {}
+    if int(delta.get("headroom_tokens_saved") or 0) <= 0 and int(
+        delta.get("upstream_prompt_token_delta") or 0
+    ) <= 0:
+        print(
+            "WARN: no token savings detected — ensure workload uses large role:tool outputs",
+            file=sys.stderr,
+        )
+        return 2
     return 0
 
 

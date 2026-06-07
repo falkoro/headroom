@@ -804,10 +804,17 @@ python scripts/bench_hermes_headroom.py
 python scripts/bench_hermes_headroom.py --multi-turn
 ```
 
-Captured on spot-tech-ci (2026-06-07): plain and Headroom→Hermes both returned
-``BENCH_OK`` from the ``grok`` backend; single-turn ``prompt_tokens`` were 3357
-each with ``tokens.saved: 0`` on synthetic log filler (routing verified; savings
-show up on real agent/tool workloads). See ``tests/test_cli/test_hermes_grok_live.py``.
+Captured on spot-tech-ci (2026-06-07, **agent-tool workload** — large
+``role: tool`` JSON output):
+
+| Path | ``prompt_tokens`` | ``tokens.saved`` |
+|------|-------------------|------------------|
+| Plain Hermes | 9,763 | — |
+| Headroom → Hermes | 7,964 | 562 (`smart_crusher`: 1,799) |
+
+Plain user/system log filler does **not** compress — use tool-output-shaped
+messages (what WSB/anime bots send). See ``tests/test_cli/hermes_workloads.py``
+and ``scripts/bench_hermes_headroom.py``.
 
 More examples:
 

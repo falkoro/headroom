@@ -2,31 +2,27 @@
 
 Grok Build's ``wrap grok`` routes ``/v1/sessions/*`` traffic — mostly passthrough.
 Hermes on spot-tech-ci exposes ``/v1/chat/completions``, which is the compressible
-path Headroom optimizes.
+path Headroom optimizes when messages include large ``role: tool`` outputs.
 
 Run on a host where Hermes llm-proxy is up (default ``:38765``):
 
-    HEADROOM_LIVE_HERMES=1 UV_SKIP_WHEEL_FILENAME_CHECK=1 \\
-        uv run --extra dev pytest tests/test_cli/test_hermes_grok_live.py -v
+    HEADROOM_LIVE_HERMES=1 pytest tests/test_cli/test_hermes_grok_live.py -v
 
-spot-tech-ci runbook (2026-06-07, ``falk@80.241.217.210``):
+spot-tech-ci (minimal venv — full ``--extra dev`` needs a C++ toolchain)::
 
-    curl -s http://127.0.0.1:38765/health          # => ok
     export PATH="$HOME/.local/bin:$PATH"
-    uv tool install 'headroom-ai[proxy]'          # once, if headroom missing
-    HEADROOM_LIVE_HERMES=1 uv run --extra dev \\
-        pytest tests/test_cli/test_hermes_grok_live.py -v
+    cd ~/headroom-wrap-grok-clean
+    uv venv .venv-live && source .venv-live/bin/activate
+    uv pip install httpx pytest
+    HEADROOM_LIVE_HERMES=1 pytest tests/test_cli/test_hermes_grok_live.py -v
     python scripts/bench_hermes_headroom.py
 
-Captured benchmark (fat single-turn prompt, grok backend):
+Captured agent-tool benchmark (2026-06-07, grok backend):
 
 | Path | ``prompt_tokens`` | Headroom ``tokens.saved`` |
 |------|-------------------|---------------------------|
-| Plain Hermes | 3357 | — |
-| Headroom → Hermes | 3357 | 0 |
-
-Routing works end-to-end; token deltas depend on workload shape (tool dumps,
-multi-turn agent loops). See ``scripts/bench_hermes_headroom.py --multi-turn``.
+| Plain Hermes | 9,763 | — |
+| Headroom → Hermes | 7,964 | 562 (smart_crusher: 1,799) |
 """
 
 from __future__ import annotations
@@ -42,6 +38,8 @@ from typing import Any
 
 import httpx
 import pytest
+
+from tests.test_cli.hermes_workloads import agent_tool_messages
 
 _LIVE = os.environ.get("HEADROOM_LIVE_HERMES") == "1"
 HERMES_BASE = os.environ.get("HEADROOM_HERMES_BASE_URL", "http://127.0.0.1:38765/v1").rstrip("/")
@@ -88,11 +86,17 @@ def _wait_proxy_ready(port: int, timeout: float = 180.0) -> None:
     raise RuntimeError(f"headroom proxy on {port} did not become ready")
 
 
-def _chat(client: httpx.Client, base_url: str, content: str) -> dict[str, Any]:
+def _chat(
+    client: httpx.Client,
+    base_url: str,
+    messages: list[dict],
+    *,
+    max_tokens: int = 24,
+) -> dict[str, Any]:
     payload = {
         "model": HERMES_MODEL,
-        "messages": [{"role": "user", "content": content}],
-        "max_tokens": 16,
+        "messages": messages,
+        "max_tokens": max_tokens,
         "temperature": 0,
         "stream": False,
     }
@@ -159,7 +163,7 @@ def test_live_plain_hermes_chat_completion(hermes_client: httpx.Client) -> None:
     body = _chat(
         hermes_client,
         HERMES_BASE,
-        f"Reply with exactly one word: {REPLY_TOKEN}",
+        [{"role": "user", "content": f"Reply with exactly one word: {REPLY_TOKEN}"}],
     )
     content = body["choices"][0]["message"]["content"]
     usage = body.get("usage") or {}
@@ -175,7 +179,7 @@ def test_live_headroom_proxy_routes_to_hermes(
     body = _chat(
         hermes_client,
         f"http://127.0.0.1:{headroom_proxy}/v1",
-        f"Reply with exactly one word: {REPLY_TOKEN}",
+        [{"role": "user", "content": f"Reply with exactly one word: {REPLY_TOKEN}"}],
     )
     content = body["choices"][0]["message"]["content"]
     assert REPLY_TOKEN in content
@@ -197,3 +201,27 @@ def test_live_headroom_openai_upstream_points_at_hermes(
     health = health_resp.json()
     config = health.get("config") if isinstance(health.get("config"), dict) else health
     assert config.get("openai_api_url") == HERMES_BASE
+
+
+@pytest.mark.skipif(not _hermes_reachable(), reason="Hermes llm-proxy not reachable")
+def test_live_headroom_compresses_agent_tool_output(
+    hermes_client: httpx.Client,
+    headroom_proxy: int,
+) -> None:
+    messages = agent_tool_messages()
+    plain = _chat(hermes_client, HERMES_BASE, messages)
+    wrapped = _chat(hermes_client, f"http://127.0.0.1:{headroom_proxy}/v1", messages)
+
+    plain_tokens = int((plain.get("usage") or {}).get("prompt_tokens") or 0)
+    wrapped_tokens = int((wrapped.get("usage") or {}).get("prompt_tokens") or 0)
+
+    stats_resp = hermes_client.get(f"http://127.0.0.1:{headroom_proxy}/stats", timeout=30.0)
+    stats_resp.raise_for_status()
+    stats = stats_resp.json()
+    saved = int((stats.get("tokens") or {}).get("saved") or 0)
+    strategy_saved = int((stats.get("tokens_saved_by_strategy") or {}).get("smart_crusher") or 0)
+
+    assert plain_tokens > 5000, "tool workload should be large enough to compress"
+    assert wrapped_tokens < plain_tokens or saved > 0 or strategy_saved > 0, (
+        f"expected compression: plain={plain_tokens} wrapped={wrapped_tokens} saved={saved}"
+    )
