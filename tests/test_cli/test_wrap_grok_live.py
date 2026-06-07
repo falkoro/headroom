@@ -29,6 +29,9 @@ Proxy log confirms Grok traffic is forwarded to the real upstream after the fix:
 Before the upstream fix, wrap grok defaulted the proxy to api.openai.com and
 /v1/settings returned 404. `wrap grok` now passes
 ``openai_api_url=https://cli-chat-proxy.grok.com/v1`` to the proxy launcher.
+
+For token benchmarks on ``/v1/chat/completions``, use Hermes + Headroom instead
+(``HEADROOM_LIVE_HERMES=1`` — see ``tests/test_cli/test_hermes_grok_live.py``).
 """
 
 from __future__ import annotations

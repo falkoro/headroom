@@ -771,6 +771,44 @@ GET  https://cli-chat-proxy.grok.com/v1/settings → HTTP/2 200 OK
 POST https://cli-chat-proxy.grok.com/v1/sessions/register → HTTP/2 200 OK
 ```
 
+**Token savings** — Grok Build headless ``-p`` uses ``/v1/sessions/*`` and
+``/v1/traces`` (passthrough today). For measurable compression on
+``/v1/chat/completions``, route through Hermes instead:
+
+```bash
+# Plain — bots already use this shape (grok-hermes → :38765/v1)
+curl -s http://127.0.0.1:38765/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"grok-4.3","messages":[{"role":"user","content":"Say OK"}],"max_tokens":8}'
+
+# Headroom → Hermes → Grok OAuth
+headroom proxy --openai-api-url http://127.0.0.1:38765/v1 --no-telemetry
+OPENAI_BASE_URL=http://127.0.0.1:8787/v1 your-openai-client
+curl -s http://127.0.0.1:8787/stats | jq '.tokens.saved'
+```
+
+**spot-tech-ci runbook** (``falk@80.241.217.210``, Hermes always-on):
+
+```bash
+curl -s http://127.0.0.1:38765/health                    # => ok
+systemctl --user status llm-proxy hermes-xai-proxy       # both active
+export PATH="$HOME/.local/bin:$PATH"
+uv tool install 'headroom-ai[proxy]'                      # once if needed
+
+# Live pytest (opt-in)
+HEADROOM_LIVE_HERMES=1 uv run --extra dev \
+  pytest tests/test_cli/test_hermes_grok_live.py -v
+
+# Token bench script
+python scripts/bench_hermes_headroom.py
+python scripts/bench_hermes_headroom.py --multi-turn
+```
+
+Captured on spot-tech-ci (2026-06-07): plain and Headroom→Hermes both returned
+``BENCH_OK`` from the ``grok`` backend; single-turn ``prompt_tokens`` were 3357
+each with ``tokens.saved: 0`` on synthetic log filler (routing verified; savings
+show up on real agent/tool workloads). See ``tests/test_cli/test_hermes_grok_live.py``.
+
 More examples:
 
 ```bash
