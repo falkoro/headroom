@@ -1,0 +1,39 @@
+name: Claude Review
+
+# Automated Claude PR review. Gated by repo/org variables:
+#   CLAUDE_REVIEW_ENABLED=true
+#   CLAUDE_REVIEW_CONFIGURED=true
+# Secret: CLAUDE_CODE_OAUTH_TOKEN
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+jobs:
+  review:
+    name: Claude review
+    if: vars.CLAUDE_REVIEW_ENABLED == 'true' && vars.CLAUDE_REVIEW_CONFIGURED == 'true'
+    runs-on: [self-hosted, linux, x64, spot-tech-ci]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: "--max-turns 25"
+          prompt: |
+            Review this pull request for the Headroom open-source project and post concise inline review comments. Approve only if it is clean. Focus on, in priority order:
+
+            1. CORRECTNESS — compression invariants, token accounting, streaming behavior, backward compatibility with wrapped SDKs and eval harnesses.
+            2. SECURITY — secret leakage in logs/fixtures, unsafe deserialization, trust-boundary mistakes in the proxy/wrapper.
+            3. API / UX — breaking public API changes without migration notes, misleading docs or benchmark claims.
+
+            Be specific with file:line. Do not nitpick style (ruff/mypy/clippy handle that).
