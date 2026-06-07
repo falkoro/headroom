@@ -807,6 +807,11 @@ systemctl --user enable --now headroom-hermes.service
 curl -s http://127.0.0.1:18787/stats | jq '.tokens.saved'
 python scripts/bench_hermes_headroom.py --canary-port 18787
 
+# UFW (Docker bridges cannot reach :18787 until allowed):
+sudo ufw allow from 172.18.0.0/16 to any port 18787 proto tcp
+sudo ufw allow from 172.20.0.0/16 to any port 18787 proto tcp
+sudo ufw allow from 172.17.0.0/16 to any port 18787 proto tcp
+
 # Route one bot (e.g. wsb-digest) through the canary in spot-tech compose:
 # FALKBOT_PROVIDER_BACKENDS baseUrl -> http://172.18.0.1:18787/v1
 # Keep IMAGE_GROK_BASE_URL on :38765 (non-chat paths).
