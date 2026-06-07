@@ -17,6 +17,8 @@ jobs:
     name: Claude review
     if: vars.CLAUDE_REVIEW_ENABLED == 'true' && vars.CLAUDE_REVIEW_CONFIGURED == 'true'
     runs-on: [self-hosted, logan-gl502vs]
+    timeout-minutes: 20
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v5
         with:
@@ -24,9 +26,46 @@ jobs:
 
       - name: Resolve Dario proxy
         id: dario
-        run: bash .github/scripts/resolve-dario-proxy.sh
+        run: |
+          set -euo pipefail
+          GW=""
+          if command -v ip >/dev/null 2>&1; then
+            GW="$(ip route 2>/dev/null | awk '/default/{print $3; exit}' || true)"
+          fi
+          for H in host.containers.internal "$GW" 172.18.0.1 172.17.0.1 127.0.0.1; do
+            [ -z "$H" ] && continue
+            body_file="$(mktemp)"
+            http_code="$(
+              curl -sS --max-time 8 -o "$body_file" -w "%{http_code}" \
+                -X POST "http://$H:3456/v1/chat/completions" \
+                -H 'content-type: application/json' \
+                -H 'authorization: Bearer dario' \
+                -d '{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"ok"}],"max_tokens":4,"stream":false}' \
+                2>/dev/null || echo "000"
+            )"
+            rm -f "$body_file"
+            case "$http_code" in
+              200)
+                {
+                  echo "available=true"
+                  echo "base_url=http://$H:3456"
+                } >> "$GITHUB_OUTPUT"
+                echo "Dario proxy reachable at $H:3456"
+                exit 0
+                ;;
+              402|429)
+                echo "available=false" >> "$GITHUB_OUTPUT"
+                echo "::warning::Dario quota exhausted (HTTP $http_code); Claude review skipped."
+                exit 0
+                ;;
+            esac
+          done
+
+          echo "available=false" >> "$GITHUB_OUTPUT"
+          echo "::warning::Dario proxy (:3456) unreachable from the runner; Claude review skipped."
 
       - uses: anthropics/claude-code-action@v1
+        if: steps.dario.outputs.available == 'true'
         env:
           ANTHROPIC_BASE_URL: ${{ steps.dario.outputs.base_url }}
         with:
