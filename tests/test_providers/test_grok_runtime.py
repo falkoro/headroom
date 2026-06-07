@@ -27,3 +27,34 @@ def test_build_launch_env_respects_empty_environ() -> None:
 
     assert env == {"GROK_CLI_CHAT_PROXY_BASE_URL": "http://127.0.0.1:8787/v1"}
     assert display == ["GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:8787/v1"]
+
+
+def test_build_launch_env_overrides_existing_grok_proxy_url() -> None:
+    """Wrap must always point Grok at the local Headroom proxy, not a stale override."""
+    env, display = build_launch_env(
+        4242,
+        {
+            "GROK_CLI_CHAT_PROXY_BASE_URL": "https://cli-chat-proxy.grok.com/v1",
+            "HOME": "/home/dev",
+        },
+    )
+
+    assert env["GROK_CLI_CHAT_PROXY_BASE_URL"] == "http://127.0.0.1:4242/v1"
+    assert env["HOME"] == "/home/dev"
+    assert display == ["GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:4242/v1"]
+
+
+def test_build_launch_env_preserves_unrelated_env_vars() -> None:
+    env, _ = build_launch_env(
+        8787,
+        {
+            "PATH": "/usr/bin",
+            "GROK_COMPACTION_MODE": "segments",
+            "GROK_COMPACTION_DETAIL": "verbose",
+        },
+    )
+
+    assert env["PATH"] == "/usr/bin"
+    assert env["GROK_COMPACTION_MODE"] == "segments"
+    assert env["GROK_COMPACTION_DETAIL"] == "verbose"
+    assert env["GROK_CLI_CHAT_PROXY_BASE_URL"] == "http://127.0.0.1:8787/v1"
