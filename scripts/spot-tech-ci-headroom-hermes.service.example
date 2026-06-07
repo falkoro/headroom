@@ -17,8 +17,9 @@ Wants=network-online.target llm-proxy.service
 [Service]
 Type=simple
 Environment=HEADROOM_TELEMETRY=off
+Environment=HEADROOM_HOST=0.0.0.0
 Environment=HEADROOM_HERMES_BASE_URL=http://127.0.0.1:38765/v1
-ExecStart=%h/.local/bin/headroom proxy --port 18787 --openai-api-url http://127.0.0.1:38765/v1 --no-telemetry
+ExecStart=%h/.local/bin/headroom proxy --host 0.0.0.0 --port 18787 --openai-api-url http://127.0.0.1:38765/v1 --no-telemetry
 Restart=on-failure
 RestartSec=5
 

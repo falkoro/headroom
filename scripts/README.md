@@ -12,7 +12,10 @@ against Headroom→Hermes on a host where Hermes llm-proxy is running (default
 ```bash
 python scripts/bench_hermes_headroom.py
 python scripts/bench_hermes_headroom.py --multi-turn
+python scripts/bench_hermes_headroom.py --canary-port 18787   # persistent systemd canary
 HEADROOM_LIVE_HERMES=1 uv run --extra dev pytest tests/test_cli/test_hermes_grok_live.py -v
+HEADROOM_LIVE_HERMES=1 HEADROOM_LIVE_CANARY=1 \
+  uv run --extra dev pytest tests/test_cli/test_hermes_canary_live.py -v
 ```
 
 See ``wiki/cli.md`` (``headroom wrap grok`` → spot-tech-ci runbook) for the full

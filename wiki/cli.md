@@ -799,11 +799,17 @@ export PATH="$HOME/.local/bin:$PATH"
 uv tool install 'headroom-ai[proxy]'                      # once if needed
 
 # Persistent canary (optional; uses :18787 — falkbot-ops docker owns :8787)
+# Binds 0.0.0.0 so Docker bots can use http://172.18.0.1:18787/v1
 cp scripts/spot-tech-ci-headroom-hermes.service.example \
   ~/.config/systemd/user/headroom-hermes.service
 systemctl --user daemon-reload
 systemctl --user enable --now headroom-hermes.service
 curl -s http://127.0.0.1:18787/stats | jq '.tokens.saved'
+python scripts/bench_hermes_headroom.py --canary-port 18787
+
+# Route one bot (e.g. wsb-digest) through the canary in spot-tech compose:
+# FALKBOT_PROVIDER_BACKENDS baseUrl -> http://172.18.0.1:18787/v1
+# Keep IMAGE_GROK_BASE_URL on :38765 (non-chat paths).
 
 # Live pytest (opt-in; minimal venv on CI host)
 HEADROOM_LIVE_HERMES=1 pytest tests/test_cli/test_hermes_grok_live.py -v

@@ -76,10 +76,38 @@ def _delta_block(plain_usage: dict, wrapped_usage: dict, token_stats: dict, stat
     }
 
 
-def run_agent_tool_turn(hermes_base: str, model: str) -> dict:
+def run_agent_tool_turn(
+    hermes_base: str,
+    model: str,
+    *,
+    canary_port: int | None = None,
+) -> dict:
     messages = agent_tool_messages()
     plain = chat(hermes_base, messages, model)
     plain_usage = plain.get("usage") or {}
+
+    if canary_port is not None:
+        wrapped = chat(f"http://127.0.0.1:{canary_port}/v1", messages, model)
+        wrapped_usage = wrapped.get("usage") or {}
+        stats = fetch_stats(canary_port)
+        token_stats = stats.get("tokens") or {}
+        delta = _delta_block(plain_usage, wrapped_usage, token_stats, stats)
+        return {
+            "mode": "agent-tool-canary",
+            "canary_port": canary_port,
+            "plain": {
+                "content": plain["choices"][0]["message"]["content"].strip(),
+                "usage": plain_usage,
+                "backend": plain.get("_backend"),
+            },
+            "headroom": {
+                "content": wrapped["choices"][0]["message"]["content"].strip(),
+                "usage": wrapped_usage,
+                "backend": wrapped.get("_backend"),
+                "tokens_saved": token_stats.get("saved"),
+            },
+            "delta": delta,
+        }
 
     port = pick_free_port()
     proc = start_headroom_proxy(port=port, hermes_base=hermes_base)
@@ -156,7 +184,7 @@ def validate_result(result: dict) -> int:
         assert strategy_saved >= MIN_SMART_CRUSHER_SAVED, (
             f"smart_crusher savings too low: {strategy_saved}"
         )
-        if result.get("mode") == "agent-tool":
+        if result.get("mode") in {"agent-tool", "agent-tool-canary"}:
             assert_compression_delta(
                 plain_prompt_tokens=plain_in,
                 wrapped_prompt_tokens=wrap_in,
@@ -172,11 +200,30 @@ def validate_result(result: dict) -> int:
         return 2
 
 
+def _canary_ready(port: int) -> bool:
+    for path in ("/readyz", "/health", "/livez"):
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=5) as resp:
+                if resp.status == 200:
+                    return True
+        except Exception:
+            continue
+    return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hermes-base", default=DEFAULT_HERMES_BASE)
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--multi-turn", action="store_true")
+    parser.add_argument(
+        "--canary-port",
+        type=int,
+        default=int(os.environ["HEADROOM_CANARY_PORT"])
+        if os.environ.get("HEADROOM_CANARY_PORT")
+        else None,
+        help="Use persistent Headroom canary on this port (default: HEADROOM_CANARY_PORT)",
+    )
     args = parser.parse_args()
     hermes_base = args.hermes_base.rstrip("/")
 
@@ -184,11 +231,19 @@ def main() -> int:
         print(f"Hermes health check failed for {hermes_health_url(hermes_base)}", file=sys.stderr)
         return 1
 
+    if args.canary_port is not None and args.multi_turn:
+        print("--canary-port cannot be combined with --multi-turn", file=sys.stderr)
+        return 1
+
+    if args.canary_port is not None and not _canary_ready(args.canary_port):
+        print(f"Canary not ready on port {args.canary_port}", file=sys.stderr)
+        return 1
+
     try:
         result = (
             run_multi_turn(hermes_base, args.model)
             if args.multi_turn
-            else run_agent_tool_turn(hermes_base, args.model)
+            else run_agent_tool_turn(hermes_base, args.model, canary_port=args.canary_port)
         )
     except urllib.error.URLError as exc:
         print(f"Request failed: {exc}", file=sys.stderr)
