@@ -163,6 +163,23 @@ def test_wrap_grok_keeps_headroom_port_long_option(
     assert env[GROK_PROXY_ENV] == "http://127.0.0.1:9999/v1"
 
 
+def test_wrap_grok_sets_grok_upstream_for_proxy(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with patch("headroom.cli.wrap.shutil.which", return_value="grok"):
+        with patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool):
+            result = runner.invoke(main, ["wrap", "grok"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["openai_api_url"] == DEFAULT_API_URL
+
+
 def test_wrap_grok_forwards_headroom_backend_options(
     runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

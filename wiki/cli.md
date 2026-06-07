@@ -754,6 +754,21 @@ grok -p "fix the bug"
 ```bash
 headroom wrap grok -p "fix the bug"
 # GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:8787/v1
+# Proxy upstream: https://cli-chat-proxy.grok.com/v1
+```
+
+**Live verification** (grok 0.2.32, authenticated host, 2026-06-07):
+
+| Mode | Command | Response | Upstream |
+|---|---|---|---|
+| Plain | `grok -p "…PLAIN_OK" --output-format plain --no-plan --always-approve` | `PLAIN_OK` | `cli-chat-proxy.grok.com` (direct) |
+| Wrapped | `headroom wrap grok -p "…HEADROOM_OK" …` | `HEADROOM_OK` | `127.0.0.1:8791/v1` → `cli-chat-proxy.grok.com` |
+
+Proxy log excerpt after a wrapped run:
+
+```text
+GET  https://cli-chat-proxy.grok.com/v1/settings → HTTP/2 200 OK
+POST https://cli-chat-proxy.grok.com/v1/sessions/register → HTTP/2 200 OK
 ```
 
 More examples:
